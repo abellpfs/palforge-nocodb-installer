@@ -1,207 +1,242 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ==============================================================================
-# Pal Forge - NoCoDB VM Creator for Proxmox
-# - Creates a Ubuntu 24.04 (Noble) cloud-init based VM
-# - Prepares it for running NoCoDB installer inside the VM
-# - Handles dir/LVM/ZFS storage correctly
-# - Cleans up downloaded cloud image from /tmp
-# ==============================================================================
+# Simple Proxmox VM creator for NocoDB
+# Creates an Ubuntu 24.04 (noble) cloud-init VM, then you run setup_nocodb.sh inside it.
 
 UBUNTU_IMG_URL="https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
-TMP_DIR="/tmp"
-LOCAL_IMG="$TMP_DIR/noble-server-cloudimg-amd64.img"
 
-CLEANUP_FILES=()
+#######################################
+# Helpers
+#######################################
+error() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
+require_root() {
+  if [[ "$(id -u)" -ne 0 ]]; then
+    error "This script must be run as root on the Proxmox host."
+  fi
+}
+
+require_cmd() {
+  for c in "$@"; do
+    command -v "$c" >/dev/null 2>&1 || error "Required command '$c' not found."
+  done
+}
 
 cleanup() {
-  echo "🧹 Running cleanup..."
-  for f in "${CLEANUP_FILES[@]}"; do
-    if [[ -f "$f" ]]; then
-      echo "  - Removing $f"
-      rm -f "$f" || true
-    fi
-  done
+  if [[ -n "${WORKDIR:-}" && -d "${WORKDIR:-}" ]]; then
+    rm -rf "$WORKDIR"
+  fi
 }
 trap cleanup EXIT
 
-echo "=============================================="
-echo "  Pal Forge - NoCoDB Proxmox VM Creator"
-echo "=============================================="
+#######################################
+# Input helpers
+#######################################
+ask_default() {
+  local prompt="$1"; shift
+  local default="$1"; shift || true
+  local var
+  read -rp "$prompt [$default]: " var
+  echo "${var:-$default}"
+}
+
+ask_required_int() {
+  local prompt="$1"
+  local val
+  while true; do
+    read -rp "$prompt: " val
+    if [[ "$val" =~ ^[0-9]+$ ]] && (( val > 0 )); then
+      echo "$val"
+      return 0
+    else
+      echo "Please enter a positive integer."
+    fi
+  done
+}
+
+#######################################
+# Main
+#######################################
+require_root
+require_cmd pvesh pvesm qm curl
+
+echo "=== NocoDB Proxmox VM Creator ==="
+
+# VMID
+default_vmid=$(pvesh get /cluster/nextid)
+VMID=$(ask_default "VM ID" "$default_vmid")
+
+# Hostname / name
+VM_NAME=$(ask_default "VM name (hostname)" "nocodb")
+
+# CPU & RAM
+CPU_CORES=$(ask_required_int "vCPU cores")
+RAM_GB=$(ask_required_int "Memory (GB)")
+RAM_MB=$((RAM_GB * 1024))
+
+# Disk size
+DISK_GB=$(ask_required_int "Disk size (GB) for main disk")
+
+# Network bridge
+BRIDGE=$(ask_default "Bridge" "vmbr0")
+
+# Storage selection (for disks & cloud-init)
+echo
+echo "Available storage (content: images):"
+pvesm status -content images | awk 'NR==1 || NR>1 {print}'
 echo
 
-# --- Ask for basic VM parameters ---------------------------------------------
-
-read -rp "VM ID (e.g. 5000): " VMID
-if [[ -z "${VMID}" ]]; then
-  echo "VM ID is required."
-  exit 1
+# Build storage menu
+mapfile -t STORAGE_LINES < <(pvesm status -content images | awk 'NR>1')
+if [[ ${#STORAGE_LINES[@]} -eq 0 ]]; then
+  error "No storage with 'images' content found. Configure storage in Proxmox first."
 fi
 
-read -rp "VM Name (e.g. nocodb-vm): " VMNAME
-VMNAME=${VMNAME:-nocodb-vm}
+echo "Select storage for disks & cloud-init:"
+idx=1
+for line in "${STORAGE_LINES[@]}"; do
+  # Example line: local-lvm data 1 1 1 ...
+  tag=$(awk '{print $1}' <<< "$line")
+  type=$(awk '{print $2}' <<< "$line")
+  free_kb=$(awk '{print $6}' <<< "$line")
+  # Convert to GiB-ish
+  free_gb=$(( free_kb / 1024 / 1024 ))
+  printf "  [%d] %s (type: %s, approx free: %d GiB)\n" "$idx" "$tag" "$type" "$free_gb"
+  ((idx++))
+done
 
-read -rp "Number of vCPUs [2]: " VCPUS
-VCPUS=${VCPUS:-2}
-
-read -rp "Memory in GB [4]: " MEM_GB
-MEM_GB=${MEM_GB:-4}
-# Convert to MB for Proxmox
-MEM_MB=$(( MEM_GB * 1024 ))
-
-# --- Choose storage for disk + cloud-init ------------------------------------
-
-echo
-echo "Available storages (for disk & cloud-init):"
-pvesm status | awk 'NR==1 {print} NR>1 {printf "  - %-15s %-10s %s\n", $1, $2, $3}'
-
-echo
-read -rp "Storage name to use (exact from list above) [local-lvm]: " DISK_STORAGE
-DISK_STORAGE=${DISK_STORAGE:-local-lvm}
-
-# Validate storage exists
-if ! pvesm status | awk 'NR>1 {print $1}' | grep -qx "$DISK_STORAGE"; then
-  echo "❌ Storage '$DISK_STORAGE' not found in pvesm status. Aborting."
-  exit 1
-fi
-
-read -rp "Disk size in GB [20]: " DISK_GB
-DISK_GB=${DISK_GB:-20}
-
-# --- Network settings --------------------------------------------------------
-
-read -rp "Bridge to use [vmbr0]: " BRIDGE
-BRIDGE=${BRIDGE:-vmbr0}
-
-read -rp "VLAN tag (blank for none): " VLAN
-if [[ -n "${VLAN}" ]]; then
-  NET0="virtio,bridge=${BRIDGE},tag=${VLAN}"
-else
-  NET0="virtio,bridge=${BRIDGE}"
-fi
-
-# --- SSH key / access --------------------------------------------------------
-
-echo
-read -rp "Use an SSH public key for cloud-init? [y/N]: " USE_SSH_KEY
-USE_SSH_KEY=${USE_SSH_KEY:-N}
-
-SSH_KEY=""
-if [[ "${USE_SSH_KEY}" =~ ^[Yy]$ ]]; then
-  echo "Paste your SSH PUBLIC key (e.g. starts with ssh-ed25519 or ssh-rsa):"
-  read -r SSH_KEY
-  if [[ -z "${SSH_KEY}" ]]; then
-    echo "No SSH key provided, continuing without."
+while true; do
+  read -rp "Enter storage option number [1-${#STORAGE_LINES[@]}]: " choice
+  if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#STORAGE_LINES[@]} )); then
+    STORAGE_TAG=$(awk '{print $1}' <<< "${STORAGE_LINES[choice-1]}")
+    STORAGE_TYPE=$(awk '{print $2}' <<< "${STORAGE_LINES[choice-1]}")
+    break
+  else
+    echo "Invalid choice. Try again."
   fi
+done
+
+echo "Using storage: $STORAGE_TAG (type: $STORAGE_TYPE)"
+
+# SSH key
+echo
+read -rp "Do you want to add an SSH public key to cloud-init? [y/N]: " use_ssh
+use_ssh=${use_ssh,,}
+SSH_KEY=""
+if [[ "$use_ssh" == "y" || "$use_ssh" == "yes" ]]; then
+  echo "Paste your SSH public key (single line), then press Enter:"
+  read -r SSH_KEY
+  [[ -z "$SSH_KEY" ]] && error "SSH key was empty."
 fi
 
-# Cloud-init user
-read -rp "Cloud-init username [nocodb]: " CI_USER
-CI_USER=${CI_USER:-nocodb}
+WORKDIR=$(mktemp -d)
+cd "$WORKDIR"
 
 echo
-echo "--------------------------------------------------"
-echo "VMID:        ${VMID}"
-echo "Name:        ${VMNAME}"
-echo "vCPUs:       ${VCPUS}"
-echo "Memory:      ${MEM_GB} GB (${MEM_MB} MB)"
-echo "Storage:     ${DISK_STORAGE}"
-echo "Disk size:   ${DISK_GB} GB"
-echo "Network:     bridge=${BRIDGE} ${VLAN:+, VLAN=${VLAN}}"
-echo "CI user:     ${CI_USER}"
-echo "SSH key:     ${USE_SSH_KEY}"
-echo "--------------------------------------------------"
-read -rp "Proceed with creation? [y/N]: " CONFIRM
-CONFIRM=${CONFIRM:-N}
-if [[ ! "${CONFIRM}" =~ ^[Yy]$ ]]; then
-  echo "Aborting."
-  exit 1
-fi
+echo "Downloading Ubuntu cloud image..."
+IMG_FILE=$(basename "$UBUNTU_IMG_URL")
+curl -fSL -o "$IMG_FILE" "$UBUNTU_IMG_URL" || error "Failed to download $UBUNTU_IMG_URL"
 
-# --- Download Ubuntu cloud image (if needed) ---------------------------------
+echo "Downloaded image: $IMG_FILE"
 
-if [[ -f "${LOCAL_IMG}" ]]; then
-  echo "✅ Found existing image at ${LOCAL_IMG}"
+# Figure out disk extension / refs like tteck script
+DISK_EXT=""
+DISK_REF=""
+DISK_IMPORT_OPT=""
+THIN_OPT=",discard=on,ssd=1"
+
+case "$STORAGE_TYPE" in
+  nfs|dir|cifs)
+    DISK_EXT=".qcow2"
+    DISK_REF="$VMID/"
+    DISK_IMPORT_OPT="-format qcow2"
+    THIN_OPT=""  # thin provisioning handled by qcow2
+    ;;
+  btrfs)
+    DISK_EXT=".raw"
+    DISK_REF="$VMID/"
+    DISK_IMPORT_OPT="-format raw"
+    THIN_OPT=""  # btrfs thin
+    ;;
+  *)
+    # For lvm-thin, zfs, etc, Proxmox handles LV/ZVOL naming; no extension or dir ref
+    DISK_EXT=""
+    DISK_REF=""
+    DISK_IMPORT_OPT=""
+    ;;
+esac
+
+# Build disk names & refs
+DISK0="vm-${VMID}-disk-0${DISK_EXT}"
+DISK1="vm-${VMID}-disk-1${DISK_EXT}"
+if [[ -n "$DISK_REF" ]]; then
+  DISK0_REF="${STORAGE_TAG}:${DISK_REF}${DISK0}"
+  DISK1_REF="${STORAGE_TAG}:${DISK_REF}${DISK1}"
 else
-  echo "📥 Downloading Ubuntu Noble cloud image..."
-  curl -fSL "${UBUNTU_IMG_URL}" -o "${LOCAL_IMG}"
-  CLEANUP_FILES+=("${LOCAL_IMG}")
+  DISK0_REF="${STORAGE_TAG}:${DISK0}"
+  DISK1_REF="${STORAGE_TAG}:${DISK1}"
 fi
 
-# --- Create VM ---------------------------------------------------------------
+echo
+echo "Creating VM $VMID ($VM_NAME)..."
 
-echo "💻 Creating VM ${VMID} (${VMNAME})..."
+# Create base VM
+qm create "$VMID" \
+  -name "$VM_NAME" \
+  -memory "$RAM_MB" \
+  -cores "$CPU_CORES" \
+  -net0 "virtio,bridge=$BRIDGE" \
+  -agent 1 \
+  -ostype l26 \
+  -serial0 socket \
+  -scsihw virtio-scsi-pci \
+  -onboot 1
 
-# Remove existing VM if already present (optional – comment out if undesired)
-if qm status "${VMID}" &>/dev/null; then
-  echo "⚠️  VMID ${VMID} already exists. Aborting to avoid overwriting."
-  exit 1
+# Allocate EFI disk (4M is plenty)
+echo "Allocating EFI disk..."
+pvesm alloc "$STORAGE_TAG" "$VMID" "$DISK0" 4M >/dev/null
+
+# Import cloud image as data disk
+echo "Importing cloud image to storage..."
+qm importdisk "$VMID" "$IMG_FILE" "$STORAGE_TAG" $DISK_IMPORT_OPT >/dev/null
+
+# Attach disks & cloud-init
+echo "Attaching disks & cloud-init..."
+qm set "$VMID" \
+  -efidisk0 "${DISK0_REF},efitype=4m" \
+  -scsi0    "${DISK1_REF}${THIN_OPT},size=${DISK_GB}G" \
+  -ide2     "${STORAGE_TAG}:cloudinit" \
+  -boot     "order=scsi0" >/dev/null
+
+# Cloud-init base config
+qm set "$VMID" \
+  -ciuser ubuntu \
+  -cipassword 'ubuntu' >/dev/null
+
+if [[ -n "$SSH_KEY" ]]; then
+  echo "Adding SSH key to cloud-init..."
+  tmp_ssh=$(mktemp)
+  echo "$SSH_KEY" > "$tmp_ssh"
+  qm set "$VMID" --sshkey "$tmp_ssh" >/dev/null
+  rm -f "$tmp_ssh"
 fi
 
-qm create "${VMID}" \
-  --name "${VMNAME}" \
-  --memory "${MEM_MB}" \
-  --cores "${VCPUS}" \
-  --net0 "${NET0}" \
-  --ostype l26 \
-  --scsihw virtio-scsi-pci
+echo
+echo "VM $VMID ($VM_NAME) created successfully."
 
-echo "📦 Importing cloud-image disk into ${DISK_STORAGE}..."
-qm importdisk "${VMID}" "${LOCAL_IMG}" "${DISK_STORAGE}" --format qcow2
-
-# Determine storage type (dir vs lvm-thin/zfs/etc.)
-STYPE=$(pvesm status | awk -v s="${DISK_STORAGE}" '$1==s {print $2}')
-
-if [[ "${STYPE}" == "dir" ]]; then
-  # Directory storage: storage:VMID/filename
-  DISK_VOL="${DISK_STORAGE}:${VMID}/vm-${VMID}-disk-0.qcow2"
+read -rp "Start the VM now? [Y/n]: " start_vm
+start_vm=${start_vm,,}
+if [[ -z "$start_vm" || "$start_vm" == "y" || "$start_vm" == "yes" ]]; then
+  echo "Starting VM..."
+  qm start "$VMID"
+  echo "VM started."
 else
-  # LVM-thin, ZFS, etc.: storage:vm-VMID-disk-0
-  DISK_VOL="${DISK_STORAGE}:vm-${VMID}-disk-0"
+  echo "VM created but not started."
 fi
 
-echo "💽 Using disk volume: ${DISK_VOL}"
-
-qm set "${VMID}" \
-  --scsi0 "${DISK_VOL}" \
-  --serial0 socket \
-  --vga serial0
-
-# Resize disk
-qm resize "${VMID}" scsi0 "${DISK_GB}G"
-
-# --- Cloud-init configuration -----------------------------------------------
-
-echo "⚙️  Configuring cloud-init..."
-
-# Add cloud-init drive
-qm set "${VMID}" --ide2 "${DISK_STORAGE}:cloudinit"
-
-# Set boot order
-qm set "${VMID}" --boot c --bootdisk scsi0
-
-# Cloud-init user
-qm set "${VMID}" --ciuser "${CI_USER}"
-
-# Optionally inject SSH key
-if [[ -n "${SSH_KEY}" ]]; then
-  qm set "${VMID}" --sshkeys <(echo "${SSH_KEY}")
-fi
-
-# Network via DHCP
-qm set "${VMID}" --ipconfig0 ip=dhcp
-
 echo
-echo "✅ VM ${VMID} (${VMNAME}) created successfully!"
-echo "   - Storage: ${DISK_STORAGE}"
-echo "   - Disk:    ${DISK_GB} GB"
-echo "   - RAM:     ${MEM_GB} GB"
-echo "   - vCPUs:   ${VCPUS}"
-echo
-echo "👉 Next steps:"
-echo "   1. Start the VM:  qm start ${VMID}"
-echo "   2. Once it boots, SSH in using the user '${CI_USER}'."
-echo "   3. Inside the VM, run the NoCoDB setup script (setup_nocodb.sh)."
-echo
-echo "🧹 Cleanup complete (downloaded image removed from /tmp if created)."
+echo "Done. Once the VM is up, SSH in and run your setup script (setup_nocodb.sh)."
