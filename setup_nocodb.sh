@@ -1,268 +1,274 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# -------- Helpers --------
+IMG_URL="https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
 
-error() {
-  echo "Error: $*" >&2
-}
+echo "=== Pal Forge NocoDB VM Creator ==="
 
-# Cleanup flags
-VM_CREATED=0
-TMP_IMG=""
+# --- Helper functions --------------------------------------------------------
 
 cleanup() {
-  if [[ -n "${TMP_IMG:-}" && -f "$TMP_IMG" ]]; then
-    echo "Cleaning up temporary image: $TMP_IMG"
-    rm -f "$TMP_IMG" || true
+  if [[ -n "${TEMP_IMG:-}" && -f "${TEMP_IMG}" ]]; then
+    echo "Cleaning up temporary image: ${TEMP_IMG}"
+    rm -f "${TEMP_IMG}" || true
   fi
 
-  if [[ "$VM_CREATED" -eq 1 && -n "${VMID:-}" ]]; then
-    echo "An error occurred. Destroying VM $VMID..."
-    qm destroy "$VMID" --purge || true
+  if [[ -n "${TEMP_SSH_KEY_FILE:-}" && -f "${TEMP_SSH_KEY_FILE}" ]]; then
+    echo "Cleaning up temporary SSH key file: ${TEMP_SSH_KEY_FILE}"
+    rm -f "${TEMP_SSH_KEY_FILE}" || true
   fi
 }
 
-trap cleanup EXIT
+destroy_vm_on_error() {
+  local exit_code=$?
+  echo "An error occurred (exit code ${exit_code})."
 
-# -------- Pre-flight checks --------
+  if [[ -n "${VMID:-}" ]]; then
+    if qm status "${VMID}" &>/dev/null; then
+      echo "Destroying VM ${VMID}..."
+      qm destroy "${VMID}" --purge >/dev/null 2>&1 || true
+      echo "VM ${VMID} destroyed."
+    fi
+  fi
 
-if ! command -v qm &>/dev/null; then
-  error "This script must be run on a Proxmox VE host (qm command not found)."
-  exit 1
-fi
+  cleanup
+  exit "${exit_code}"
+}
 
-if ! command -v pvesm &>/dev/null; then
-  error "pvesm command not found. Are you on a Proxmox node?"
-  exit 1
-fi
+trap destroy_vm_on_error ERR
 
-if [[ $EUID -ne 0 ]]; then
-  error "Please run as root (or with sudo)."
-  exit 1
-fi
+require_cmd() {
+  if ! command -v "$1" &>/dev/null; then
+    echo "Error: required command '$1' is not installed or not in PATH."
+    exit 1
+  fi
+}
 
-# -------- Ask for basics --------
+# --- Sanity checks -----------------------------------------------------------
 
-read -rp "VM name [nocodb]: " VM_NAME
-VM_NAME=${VM_NAME:-nocodb}
+require_cmd qm
+require_cmd pvesm
+require_cmd curl
 
-# Suggest next free VMID between 5000–6000
+# --- Choose VM ID ------------------------------------------------------------
+
+echo
+echo "Finding first available VMID between 5000 and 6000..."
 DEFAULT_VMID=""
-for id in {5000..6000}; do
+for id in $(seq 5000 6000); do
   if ! qm status "$id" &>/dev/null; then
     DEFAULT_VMID="$id"
     break
   fi
 done
 
-if [[ -z "$DEFAULT_VMID" ]]; then
-  echo "No free VMID found between 5000–6000. You'll need to choose manually."
-  read -rp "VM ID: " VMID
-else
-  read -rp "VM ID [$DEFAULT_VMID]: " VMID
-  VMID=${VMID:-$DEFAULT_VMID}
-fi
-
-if qm status "$VMID" &>/dev/null; then
-  error "VM ID $VMID already exists. Choose another one."
+if [[ -z "${DEFAULT_VMID}" ]]; then
+  echo "Error: No free VMID found between 5000 and 6000."
   exit 1
 fi
 
-read -rp "CPU cores [2]: " CORES
-CORES=${CORES:-2}
+read -rp "Enter VM ID [${DEFAULT_VMID}]: " VMID
+VMID="${VMID:-$DEFAULT_VMID}"
 
-read -rp "Memory (in GB) [4]: " MEM_GB
-MEM_GB=${MEM_GB:-4}
+if qm status "${VMID}" &>/dev/null; then
+  echo "Error: VMID ${VMID} already exists."
+  exit 1
+fi
+
+# --- Basic VM details --------------------------------------------------------
+
+read -rp "Enter VM name [nocodb]: " VM_NAME
+VM_NAME="${VM_NAME:-nocodb}"
+
+read -rp "vCPUs [2]: " CORES
+CORES="${CORES:-2}"
+
+read -rp "Memory in GB [4]: " MEM_GB
+MEM_GB="${MEM_GB:-4}"
+if ! [[ "${MEM_GB}" =~ ^[0-9]+$ ]]; then
+  echo "Error: Memory must be an integer number of GB."
+  exit 1
+fi
 MEM_MB=$((MEM_GB * 1024))
 
-read -rp "Disk size (in GB) [40]: " DISK_GB
-DISK_GB=${DISK_GB:-40}
-
-# -------- Storage selection (by number) --------
-
-echo "Available storages:"
-pvesm status
-echo
-
-mapfile -t STORAGES < <(pvesm status | awk 'NR>1 {print $1}')
-
-if [[ ${#STORAGES[@]} -eq 0 ]]; then
-  error "No storages found from pvesm status."
+read -rp "Disk size in GB [40]: " DISK_GB
+DISK_GB="${DISK_GB:-40}"
+if ! [[ "${DISK_GB}" =~ ^[0-9]+$ ]]; then
+  echo "Error: Disk size must be an integer number of GB."
   exit 1
 fi
 
-echo "Select storage for disk & cloud-init:"
+# --- Storage selection -------------------------------------------------------
+
+echo
+echo "Available storages (for VM disk):"
+mapfile -t STORAGES < <(pvesm status -content images | awk 'NR>1 {print $1}')
+if [[ ${#STORAGES[@]} -eq 0 ]]; then
+  echo "Error: No storage with 'images' content found."
+  exit 1
+fi
+
 for i in "${!STORAGES[@]}"; do
   idx=$((i + 1))
-  echo "  $idx) ${STORAGES[$i]}"
+  printf "  %d) %s\n" "$idx" "${STORAGES[$i]}"
 done
 
-read -rp "Choice [1]: " STORAGE_CHOICE
-STORAGE_CHOICE=${STORAGE_CHOICE:-1}
+read -rp "Select storage for VM disk [1]: " DISK_STORAGE_IDX
+DISK_STORAGE_IDX="${DISK_STORAGE_IDX:-1}"
+if ! [[ "${DISK_STORAGE_IDX}" =~ ^[0-9]+$ ]] || (( DISK_STORAGE_IDX < 1 || DISK_STORAGE_IDX > ${#STORAGES[@]} )); then
+  echo "Error: Invalid selection."
+  exit 1
+fi
+DISK_STORAGE="${STORAGES[$((DISK_STORAGE_IDX - 1))]}"
 
-if ! [[ "$STORAGE_CHOICE" =~ ^[0-9]+$ ]] || (( STORAGE_CHOICE < 1 || STORAGE_CHOICE > ${#STORAGES[@]} )); then
-  error "Invalid storage choice."
+echo
+echo "Available storages (for cloud-init):"
+mapfile -t CI_STORAGES < <(pvesm status -content images | awk 'NR>1 {print $1}')
+if [[ ${#CI_STORAGES[@]} -eq 0 ]]; then
+  echo "Error: No storage with 'images' content found for cloud-init."
   exit 1
 fi
 
-STORAGE="${STORAGES[$((STORAGE_CHOICE - 1))]}"
-echo "Using storage: $STORAGE"
+for i in "${!CI_STORAGES[@]}"; do
+  idx=$((i + 1))
+  printf "  %d) %s\n" "$idx" "${CI_STORAGES[$i]}"
+done
 
-# -------- Network / bridge --------
+read -rp "Select storage for cloud-init disk [1]: " CI_STORAGE_IDX
+CI_STORAGE_IDX="${CI_STORAGE_IDX:-1}"
+if ! [[ "${CI_STORAGE_IDX}" =~ ^[0-9]+$ ]] || (( CI_STORAGE_IDX < 1 || CI_STORAGE_IDX > ${#CI_STORAGES[@]} )); then
+  echo "Error: Invalid selection."
+  exit 1
+fi
+CI_STORAGE="${CI_STORAGES[$((CI_STORAGE_IDX - 1))]}"
 
-read -rp "Bridge name [vmbr0]: " BRIDGE
-BRIDGE=${BRIDGE:-vmbr0}
+# --- Network configuration ---------------------------------------------------
 
-# -------- Cloud-init user & password --------
+echo
+echo "Network configuration:"
+read -rp "Use DHCP for IP? [Y/n]: " USE_DHCP
+USE_DHCP="${USE_DHCP:-Y}"
 
-read -rp "VM username [ubuntu]: " CI_USER
-CI_USER=${CI_USER:-ubuntu}
+IPCONFIG0=""
+if [[ "${USE_DHCP}" =~ ^[Yy]$ ]]; then
+  IPCONFIG0="ip=dhcp"
+else
+  echo "Static IP configuration:"
+  read -rp "IP (with CIDR), e.g. 10.0.0.50/24: " STATIC_IP
+  read -rp "Gateway IP, e.g. 10.0.0.1: " GATEWAY_IP
 
-# Prompt for password (hidden)
+  if [[ -z "${STATIC_IP}" || -z "${GATEWAY_IP}" ]]; then
+    echo "Error: Static IP and gateway must both be provided."
+    exit 1
+  fi
+  IPCONFIG0="ip=${STATIC_IP},gw=${GATEWAY_IP}"
+fi
+
+# --- SSH / cloud-init user configuration ------------------------------------
+
+echo
+read -rp "VM username [nocodbadmin]: " CI_USER
+CI_USER="${CI_USER:-nocodbadmin}"
+
 while true; do
-  read -srp "VM password: " CI_PASS
+  read -srp "Password for user '${CI_USER}': " CI_PASS
   echo
   read -srp "Confirm password: " CI_PASS_CONFIRM
   echo
-  if [[ "$CI_PASS" == "$CI_PASS_CONFIRM" && -n "$CI_PASS" ]]; then
+  if [[ "${CI_PASS}" == "${CI_PASS_CONFIRM}" ]]; then
     break
   else
-    echo "Passwords do not match or are empty. Try again."
+    echo "Passwords do not match. Please try again."
   fi
 done
 
-# -------- SSH public key (optional) --------
+echo
+read -rp "Provide SSH public key for '${CI_USER}'? [y/N]: " USE_SSH_KEY
+USE_SSH_KEY="${USE_SSH_KEY:-N}"
 
-read -rp "Use an SSH public key? (y/N): " USE_SSHKEY
-USE_SSHKEY=${USE_SSHKEY:-N}
-
-SSHKEY_FILE=""
-if [[ "$USE_SSHKEY" =~ ^[Yy]$ ]]; then
-  read -rp "Enter path to SSH public key file [~/.ssh/id_rsa.pub]: " SSHKEY_PATH
-  SSHKEY_PATH=${SSHKEY_PATH:-~/.ssh/id_rsa.pub}
-  SSHKEY_PATH=$(eval echo "$SSHKEY_PATH")
-  if [[ ! -f "$SSHKEY_PATH" ]]; then
-    error "SSH key file '$SSHKEY_PATH' not found."
-    exit 1
+TEMP_SSH_KEY_FILE=""
+if [[ "${USE_SSH_KEY}" =~ ^[Yy]$ ]]; then
+  read -rp "Enter path to SSH public key file (leave blank to paste key): " SSH_KEY_PATH
+  if [[ -n "${SSH_KEY_PATH}" && -f "${SSH_KEY_PATH}" ]]; then
+    TEMP_SSH_KEY_FILE="${SSH_KEY_PATH}"
+  else
+    echo "Paste SSH public key (single line, then press Enter):"
+    read -r SSH_KEY_LINE
+    if [[ -n "${SSH_KEY_LINE}" ]]; then
+      TEMP_SSH_KEY_FILE="$(mktemp)"
+      echo "${SSH_KEY_LINE}" > "${TEMP_SSH_KEY_FILE}"
+    fi
   fi
-  SSHKEY_FILE="$SSHKEY_PATH"
 fi
 
-# -------- IP config (cloud-init ipconfig0) --------
-
-read -rp "Use static IP instead of DHCP? (y/N): " USE_STATIC
-USE_STATIC=${USE_STATIC:-N}
-
-VM_IP=""
-VM_CIDR=""
-VM_GW=""
-if [[ "$USE_STATIC" =~ ^[Yy]$ ]]; then
-  read -rp "Static IP (e.g. 10.1.10.50): " VM_IP
-  read -rp "CIDR prefix (e.g. 24 for /24): " VM_CIDR
-  read -rp "Gateway IP (e.g. 10.1.10.1): " VM_GW
-  IP_CONFIG="ip=${VM_IP}/${VM_CIDR},gw=${VM_GW}"
-else
-  IP_CONFIG="ip=dhcp"
-fi
-
-# -------- Download Ubuntu cloud image --------
-
-IMG_URL="https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
-echo "Downloading Ubuntu 24.04 (noble) cloud image..."
-TMP_IMG=$(mktemp --suffix=.img)
-curl -L "$IMG_URL" -o "$TMP_IMG"
-
-# -------- Create VM --------
-
-echo "Creating VM $VMID ($VM_NAME)..."
-qm create "$VMID" \
-  --name "$VM_NAME" \
-  --memory "$MEM_MB" \
-  --cores "$CORES" \
-  --net0 "virtio,bridge=${BRIDGE}" \
-  --agent enabled=1 \
-  --ostype l26
-
-VM_CREATED=1
-
-echo "Importing disk to storage '$STORAGE'..."
-qm importdisk "$VMID" "$TMP_IMG" "$STORAGE" --format qcow2
-
-# Get the actual volume ID for this VM's imported disk
-# pvesm list output: volid format type size used avail ...
-# We want something like: STORAGE:vm-VMID-disk-0
-VOLID=$(pvesm list "$STORAGE" | awk -v vmid="$VMID" '$1 ~ ("vm-"vmid"-disk-0") {print $1; exit}')
-
-if [[ -z "$VOLID" ]]; then
-  echo "Debug: pvesm list $STORAGE output:" >&2
-  pvesm list "$STORAGE" >&2
-  error "Could not determine imported disk volid on storage '$STORAGE'."
-  exit 1
-fi
-
-echo "Attaching disk as scsi0 ($VOLID)..."
-qm set "$VMID" --scsihw virtio-scsi-pci --scsi0 "$VOLID"
-
-echo "Resizing disk to ${DISK_GB}G..."
-qm resize "$VMID" scsi0 "${DISK_GB}G"
-
-echo "Allocating EFI disk..."
-qm set "$VMID" --efidisk0 "${STORAGE}:0,pre-enrolled-keys=1"
-
-echo "Adding cloud-init drive..."
-qm set "$VMID" --ide2 "${STORAGE}:cloudinit"
-
-echo "Configuring boot & console..."
-qm set "$VMID" --boot order=scsi0 --bootdisk scsi0
-qm set "$VMID" --serial0 socket --vga serial0
-
-echo "Setting cloud-init user & password..."
-qm set "$VMID" --ciuser "$CI_USER" --cipassword "$CI_PASS"
-
-if [[ -n "$SSHKEY_FILE" ]]; then
-  echo "Adding SSH public key from $SSHKEY_FILE..."
-  qm set "$VMID" --sshkey "$SSHKEY_FILE"
-fi
-
-echo "Configuring IP (${IP_CONFIG})..."
-qm set "$VMID" --ipconfig0 "$IP_CONFIG"
-
-echo "Final VM config:"
-qm config "$VMID"
-
-echo "Starting VM $VMID..."
-qm start "$VMID"
-
-# If we got here, everything is good – disable cleanup destroy
-VM_CREATED=0
+# --- Download cloud image ----------------------------------------------------
 
 echo
-echo "============================================================"
-echo " VM $VMID ($VM_NAME) created and started successfully."
-echo "------------------------------------------------------------"
-echo "  Username:   $CI_USER"
-echo "  Password:   (the one you entered)"
-echo "  Network:    $BRIDGE"
-if [[ "$USE_STATIC" =~ ^[Yy]$ && -n "$VM_IP" ]]; then
-  echo "  IP (static): $VM_IP/$VM_CIDR (gw: $VM_GW)"
-  echo
-  echo "You can SSH in once cloud-init finishes with:"
-  echo "  ssh ${CI_USER}@${VM_IP}"
-else
-  echo "  IP: DHCP (check your DHCP server or run from Proxmox console:"
-  echo "       'ip a' inside the VM to see the address)"
-  echo
-  echo "Once you know the IP, SSH in with:"
-  echo "  ssh ${CI_USER}@<VM_IP>"
+TEMP_IMG="$(mktemp --suffix=.img)"
+echo "Downloading Ubuntu Noble cloud image to ${TEMP_IMG}..."
+curl -L "${IMG_URL}" -o "${TEMP_IMG}"
+
+# --- Create VM ---------------------------------------------------------------
+
+echo
+echo "Creating VM ${VMID} (${VM_NAME})..."
+qm create "${VMID}" \
+  --name "${VM_NAME}" \
+  --memory "${MEM_MB}" \
+  --cores "${CORES}" \
+  --net0 "virtio,bridge=vmbr0" \
+  --ostype l26 \
+  --scsihw virtio-scsi-pci \
+  --agent enabled=1
+
+echo "Importing cloud image to storage '${DISK_STORAGE}'..."
+qm importdisk "${VMID}" "${TEMP_IMG}" "${DISK_STORAGE}" --format qcow2
+
+echo "Determining imported disk volid on storage '${DISK_STORAGE}'..."
+IMPORTED_VOLID=$(pvesm list "${DISK_STORAGE}" | awk -v vmid="${VMID}" '
+  NR>1 && $2 ~ ("^" vmid "/vm-" vmid "-disk-0") { print $1 ":" $2; exit }
+')
+
+if [[ -z "${IMPORTED_VOLID}" ]]; then
+  # Fallback guess; works on most directory / thin-lvm setups
+  IMPORTED_VOLID="${DISK_STORAGE}:${VMID}/vm-${VMID}-disk-0.qcow2"
+  echo "Warning: Could not auto-detect volid, guessing: ${IMPORTED_VOLID}"
 fi
 
-if [[ -n "$SSHKEY_FILE" ]]; then
-  echo
-  echo "SSH key-based auth is enabled using key from:"
-  echo "  $SSHKEY_FILE"
-else
-  echo
-  echo "Password-based SSH auth should work with the username & password above."
+echo "Attaching disk as scsi0 (${IMPORTED_VOLID})..."
+qm set "${VMID}" --scsi0 "${IMPORTED_VOLID}",discard=on
+
+echo "Resizing disk to ${DISK_GB}G..."
+qm resize "${VMID}" scsi0 "${DISK_GB}G"
+
+echo "Attaching cloud-init drive on '${CI_STORAGE}'..."
+qm set "${VMID}" --ide2 "${CI_STORAGE}:cloudinit"
+
+echo "Setting boot options..."
+qm set "${VMID}" --boot c --bootdisk scsi0
+
+echo "Enabling serial console..."
+qm set "${VMID}" --serial0 socket --vga serial0
+
+echo "Configuring IP (${IPCONFIG0})..."
+qm set "${VMID}" --ipconfig0 "${IPCONFIG0}"
+
+echo "Configuring cloud-init user '${CI_USER}' and password..."
+qm set "${VMID}" --ciuser "${CI_USER}" --cipassword "${CI_PASS}"
+
+if [[ -n "${TEMP_SSH_KEY_FILE}" ]]; then
+  echo "Adding SSH public key from ${TEMP_SSH_KEY_FILE}..."
+  qm set "${VMID}" --sshkey "${TEMP_SSH_KEY_FILE}"
 fi
-echo "============================================================"
+
+# --- Start VM ----------------------------------------------------------------
+
+echo "Starting VM ${VMID}..."
+qm start "${VMID}"
+
+echo "VM ${VMID} (${VM_NAME}) created and started successfully."
+echo "You can now connect via SSH once cloud-init finishes applying configuration."
+
+# --- Clean up temp image / temp key -----------------------------------------
+
+cleanup
