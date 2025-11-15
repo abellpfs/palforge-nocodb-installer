@@ -79,19 +79,35 @@ MEM_MB=$((MEM_GB * 1024))
 read -rp "Disk size (in GB) [40]: " DISK_GB
 DISK_GB=${DISK_GB:-40}
 
-# -------- Storage selection --------
+# -------- Storage selection (by number) --------
 
 echo "Available storages:"
 pvesm status
-
 echo
-read -rp "Storage for disk & cloud-init [local-lvm]: " STORAGE
-STORAGE=${STORAGE:-local-lvm}
 
-if ! pvesm status | awk 'NR>1 {print $1}' | grep -qx "$STORAGE"; then
-  error "Storage '$STORAGE' not found in pvesm status."
+mapfile -t STORAGES < <(pvesm status | awk 'NR>1 {print $1}')
+
+if [[ ${#STORAGES[@]} -eq 0 ]]; then
+  error "No storages found from pvesm status."
   exit 1
 fi
+
+echo "Select storage for disk & cloud-init:"
+for i in "${!STORAGES[@]}"; do
+  idx=$((i + 1))
+  echo "  $idx) ${STORAGES[$i]}"
+done
+
+read -rp "Choice [1]: " STORAGE_CHOICE
+STORAGE_CHOICE=${STORAGE_CHOICE:-1}
+
+if ! [[ "$STORAGE_CHOICE" =~ ^[0-9]+$ ]] || (( STORAGE_CHOICE < 1 || STORAGE_CHOICE > ${#STORAGES[@]} )); then
+  error "Invalid storage choice."
+  exit 1
+fi
+
+STORAGE="${STORAGES[$((STORAGE_CHOICE - 1))]}"
+echo "Using storage: $STORAGE"
 
 # -------- Network / bridge --------
 
@@ -171,9 +187,13 @@ echo "Importing disk to storage '$STORAGE'..."
 qm importdisk "$VMID" "$TMP_IMG" "$STORAGE" --format qcow2
 
 # Get the actual volume ID for this VM's imported disk
-VOLID=$(pvesm list "$STORAGE" | awk -v vmid="$VMID" '$2 ~ ("vm-"vmid"-disk-0") {print $1}')
+# pvesm list output: volid format type size used avail ...
+# We want something like: STORAGE:vm-VMID-disk-0
+VOLID=$(pvesm list "$STORAGE" | awk -v vmid="$VMID" '$1 ~ ("vm-"vmid"-disk-0") {print $1; exit}')
 
 if [[ -z "$VOLID" ]]; then
+  echo "Debug: pvesm list $STORAGE output:" >&2
+  pvesm list "$STORAGE" >&2
   error "Could not determine imported disk volid on storage '$STORAGE'."
   exit 1
 fi
@@ -183,6 +203,9 @@ qm set "$VMID" --scsihw virtio-scsi-pci --scsi0 "$VOLID"
 
 echo "Resizing disk to ${DISK_GB}G..."
 qm resize "$VMID" scsi0 "${DISK_GB}G"
+
+echo "Allocating EFI disk..."
+qm set "$VMID" --efidisk0 "${STORAGE}:0,pre-enrolled-keys=1"
 
 echo "Adding cloud-init drive..."
 qm set "$VMID" --ide2 "${STORAGE}:cloudinit"
