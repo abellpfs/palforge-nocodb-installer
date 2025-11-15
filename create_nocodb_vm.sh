@@ -48,10 +48,23 @@ fi
 
 echo "=== Pal Forge NocoDB VM Creator ==="
 
-# VM ID
-read -rp "Enter VM ID (leave blank to auto-select next free ID): " VMID_INPUT
+# Determine default VMID: first free in 5000–6000, else /cluster/nextid
+USED_IDS="$(qm list | awk 'NR>1 {print $1}')"
+DEFAULT_VMID=""
+for id in $(seq 5000 6000); do
+  if ! grep -q "^$id$" <<< "$USED_IDS"; then
+    DEFAULT_VMID="$id"
+    break
+  fi
+done
+
+if [[ -z "$DEFAULT_VMID" ]]; then
+  DEFAULT_VMID="$(pvesh get /cluster/nextid)"
+fi
+
+read -rp "Enter VM ID [${DEFAULT_VMID}]: " VMID_INPUT
 if [[ -z "$VMID_INPUT" ]]; then
-  VMID="$(pvesh get /cluster/nextid)"
+  VMID="$DEFAULT_VMID"
 else
   VMID="$VMID_INPUT"
 fi
@@ -68,7 +81,6 @@ CORE_COUNT="${CORE_COUNT:-2}"
 # Memory in GB
 read -rp "Memory (in GB) [4]: " MEM_GB
 MEM_GB="${MEM_GB:-4}"
-# Convert to MiB for Proxmox
 if ! [[ "$MEM_GB" =~ ^[0-9]+$ ]]; then
   echo "Memory must be an integer in GB."
   exit 1
@@ -125,6 +137,24 @@ fi
 STORAGE="${STORAGE_TAGS[$((STORAGE_INDEX-1))]}"
 echo "Using storage: $STORAGE"
 
+# Cloud-init username & password
+read -rp "Cloud-init username [nocodb]: " CI_USER
+CI_USER="${CI_USER:-nocodb}"
+
+while true; do
+  read -srp "Cloud-init password (will not echo): " CI_PASS
+  echo
+  read -srp "Confirm password: " CI_PASS2
+  echo
+  if [[ "$CI_PASS" != "$CI_PASS2" ]]; then
+    echo "Passwords do not match, please try again."
+  elif [[ -z "$CI_PASS" ]]; then
+    echo "Password cannot be empty, please try again."
+  else
+    break
+  fi
+done
+
 # Ask about SSH key usage
 USE_SSH_KEY="n"
 read -rp "Do you want to inject an SSH public key for cloud-init? (y/N): " USE_SSH_KEY
@@ -169,7 +199,7 @@ curl -fSL -o "$IMG_FILE" "$IMG_URL"
 ### ===== Determine storage type & disk naming =====
 
 STORAGE_TYPE=$(pvesm status -storage "$STORAGE" | awk 'NR>1 {print $2}')
-THIN="discard=on,ssd=1,"      # mimic tteck's THIN usage for non-dir/nfs/cifs
+THIN="discard=on,ssd=1,"
 DISK_EXT=""
 DISK_REF=""
 DISK_IMPORT=""
@@ -177,11 +207,10 @@ EFI_FORMAT=",efitype=4m"
 
 case "$STORAGE_TYPE" in
   nfs|dir|cifs)
-    # directory-like storage
     DISK_EXT=".qcow2"
     DISK_REF="$VMID/"
     DISK_IMPORT="-format qcow2"
-    THIN=""                 # THIN not used on dir-like storage
+    THIN=""
     ;;
   btrfs)
     DISK_EXT=".raw"
@@ -191,14 +220,10 @@ case "$STORAGE_TYPE" in
     THIN=""
     ;;
   *)
-    # LVM / ZFS / etc - keep default THIN
-    DISK_EXT=""
-    DISK_REF=""
-    DISK_IMPORT=""
+    # LVM / ZFS / etc - keep defaults
     ;;
 esac
 
-# Build disk names similar to tteck:
 DISK0="vm-${VMID}-disk-0${DISK_EXT}"
 DISK1="vm-${VMID}-disk-1${DISK_EXT}"
 DISK0_REF="${STORAGE}:${DISK_REF}${DISK0}"
@@ -240,14 +265,13 @@ qm set "$VMID" \
 echo "Configuring cloud-init for $VM_NAME..."
 
 qm set "$VMID" \
-  -ciuser nocodb \
-  -cipassword "ChangeMeNow123!" >/dev/null
+  -ciuser "$CI_USER" \
+  -cipassword "$CI_PASS" >/dev/null
 
 if [[ -n "$SSH_PUB_KEY" ]]; then
   qm set "$VMID" --sshkey <(printf '%s\n' "$SSH_PUB_KEY") >/dev/null
 fi
 
-# (Optional) set dns and ip to DHCP (cloud-init defaults usually DHCP)
 qm set "$VMID" -ipconfig0 ip=dhcp >/dev/null
 
 ### ===== Start VM =====
@@ -255,7 +279,7 @@ qm set "$VMID" -ipconfig0 ip=dhcp >/dev/null
 echo "Starting VM $VMID..."
 qm start "$VMID" >/dev/null
 
-# If we reach here successfully, do not destroy VM on normal exit.
+# Success: don't destroy VM on normal exit
 VM_CREATED=0
 
 popd >/dev/null
@@ -269,15 +293,14 @@ echo " vCPUs:     $CORE_COUNT"
 echo " Memory:    ${MEM_GB}G (${MEM_MB} MiB)"
 echo " Disk:      ${DISK_GB}G on storage $STORAGE"
 echo " Bridge:    $BRIDGE"
+echo " SSH user:  $CI_USER"
 if [[ -n "$SSH_PUB_KEY" ]]; then
-  echo " SSH user:  nocodb"
-  echo " SSH key:   injected via cloud-init"
+  echo " Auth:      SSH key (password also set for console login)"
 else
-  echo " SSH user:  nocodb"
-  echo " Password:  ChangeMeNow123!"
+  echo " Password:  (cloud-init password you just set)"
 fi
 echo "---------------------------------------"
 echo "Next steps:"
-echo " - Get the VM IP from Proxmox (e.g., qm guest cmd $VMID network-get-interfaces)"
-echo " - SSH in as 'nocodb' and run setup_nocodb.sh inside the VM."
+echo " - Get the VM IP from Proxmox (e.g., 'qm guest cmd $VMID network-get-interfaces')."
+echo " - SSH in as '$CI_USER' and run setup_nocodb.sh inside the VM."
 echo "======================================="
