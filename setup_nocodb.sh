@@ -1,216 +1,268 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "=== Pal Forge | NocoDB Stack Installer (inside VM) ==="
-echo
+# -------- Helpers --------
 
-# Determine sudo usage and user home
-if [[ "$(id -u)" -eq 0 ]]; then
-  SUDO=""
-  DEFAULT_USER="${SUDO_USER:-$(logname 2>/dev/null || echo root)}"
+error() {
+  echo "Error: $*" >&2
+}
+
+# Cleanup flags
+VM_CREATED=0
+TMP_IMG=""
+
+cleanup() {
+  if [[ -n "${TMP_IMG:-}" && -f "$TMP_IMG" ]]; then
+    echo "Cleaning up temporary image: $TMP_IMG"
+    rm -f "$TMP_IMG" || true
+  fi
+
+  if [[ "$VM_CREATED" -eq 1 && -n "${VMID:-}" ]]; then
+    echo "An error occurred. Destroying VM $VMID..."
+    qm destroy "$VMID" --purge || true
+  fi
+}
+
+trap cleanup EXIT
+
+# -------- Pre-flight checks --------
+
+if ! command -v qm &>/dev/null; then
+  error "This script must be run on a Proxmox VE host (qm command not found)."
+  exit 1
+fi
+
+if ! command -v pvesm &>/dev/null; then
+  error "pvesm command not found. Are you on a Proxmox node?"
+  exit 1
+fi
+
+if [[ $EUID -ne 0 ]]; then
+  error "Please run as root (or with sudo)."
+  exit 1
+fi
+
+# -------- Ask for basics --------
+
+read -rp "VM name [nocodb]: " VM_NAME
+VM_NAME=${VM_NAME:-nocodb}
+
+# Suggest next free VMID between 5000–6000
+DEFAULT_VMID=""
+for id in {5000..6000}; do
+  if ! qm status "$id" &>/dev/null; then
+    DEFAULT_VMID="$id"
+    break
+  fi
+done
+
+if [[ -z "$DEFAULT_VMID" ]]; then
+  echo "No free VMID found between 5000–6000. You'll need to choose manually."
+  read -rp "VM ID: " VMID
 else
-  SUDO="sudo"
-  DEFAULT_USER="$(whoami)"
+  read -rp "VM ID [$DEFAULT_VMID]: " VMID
+  VMID=${VMID:-$DEFAULT_VMID}
 fi
 
-read -rp "Linux user to own the NocoDB files [$DEFAULT_USER]: " APP_USER
-APP_USER=${APP_USER:-$DEFAULT_USER}
+if qm status "$VMID" &>/dev/null; then
+  error "VM ID $VMID already exists. Choose another one."
+  exit 1
+fi
 
-APP_HOME=$(eval echo "~${APP_USER}")
-NOCODB_DIR="${APP_HOME}/nocodb"
+read -rp "CPU cores [2]: " CORES
+CORES=${CORES:-2}
 
-echo "Using app user: ${APP_USER}"
-echo "NocoDB directory: ${NOCODB_DIR}"
-mkdir -p "$NOCODB_DIR"
-chown -R "${APP_USER}:${APP_USER}" "$NOCODB_DIR"
+read -rp "Memory (in GB) [4]: " MEM_GB
+MEM_GB=${MEM_GB:-4}
+MEM_MB=$((MEM_GB * 1024))
 
-# --- Ask for basic config ---
-read -rp "Public domain for NocoDB (e.g. sales.palforge.it): " NC_DOMAIN
-NC_DOMAIN=${NC_DOMAIN:-sales.palforge.it}
+read -rp "Disk size (in GB) [40]: " DISK_GB
+DISK_GB=${DISK_GB:-40}
 
-read -rp "Postgres DB name [nocodb]: " NC_DB_NAME
-NC_DB_NAME=${NC_DB_NAME:-nocodb}
+# -------- Storage selection (by number) --------
 
-read -rp "Postgres DB user [nocodb]: " NC_DB_USER
-NC_DB_USER=${NC_DB_USER:-nocodb}
-
-read -rsp "Postgres DB password (leave blank to auto-generate): " NC_DB_PASSWORD
+echo "Available storages:"
+pvesm status
 echo
-if [[ -z "${NC_DB_PASSWORD}" ]]; then
-  if command -v openssl >/dev/null 2>&1; then
-    NC_DB_PASSWORD=$(openssl rand -base64 18)
-  else
-    NC_DB_PASSWORD="ChangeMe_$(date +%s)"
-  fi
-  echo "Generated DB password: ${NC_DB_PASSWORD}"
+
+mapfile -t STORAGES < <(pvesm status | awk 'NR>1 {print $1}')
+
+if [[ ${#STORAGES[@]} -eq 0 ]]; then
+  error "No storages found from pvesm status."
+  exit 1
 fi
 
-TIMEZONE_DEFAULT="America/Denver"
-read -rp "Timezone for containers [$TIMEZONE_DEFAULT]: " TZ
-TZ=${TZ:-$TIMEZONE_DEFAULT}
+echo "Select storage for disk & cloud-init:"
+for i in "${!STORAGES[@]}"; do
+  idx=$((i + 1))
+  echo "  $idx) ${STORAGES[$i]}"
+done
 
-# --- Install required packages & Docker if missing ---
+read -rp "Choice [1]: " STORAGE_CHOICE
+STORAGE_CHOICE=${STORAGE_CHOICE:-1}
 
-if ! command -v docker >/dev/null 2>&1; then
-  echo "Docker not found. Installing Docker Engine + docker compose plugin..."
-  $SUDO apt-get update
-  $SUDO apt-get install -y ca-certificates curl gnupg lsb-release
+if ! [[ "$STORAGE_CHOICE" =~ ^[0-9]+$ ]] || (( STORAGE_CHOICE < 1 || STORAGE_CHOICE > ${#STORAGES[@]} )); then
+  error "Invalid storage choice."
+  exit 1
+fi
 
-  $SUDO install -m 0755 -d /etc/apt/keyrings
-  if [[ ! -f /etc/apt/keyrings/docker.gpg ]]; then
-    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | $SUDO gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+STORAGE="${STORAGES[$((STORAGE_CHOICE - 1))]}"
+echo "Using storage: $STORAGE"
+
+# -------- Network / bridge --------
+
+read -rp "Bridge name [vmbr0]: " BRIDGE
+BRIDGE=${BRIDGE:-vmbr0}
+
+# -------- Cloud-init user & password --------
+
+read -rp "VM username [ubuntu]: " CI_USER
+CI_USER=${CI_USER:-ubuntu}
+
+# Prompt for password (hidden)
+while true; do
+  read -srp "VM password: " CI_PASS
+  echo
+  read -srp "Confirm password: " CI_PASS_CONFIRM
+  echo
+  if [[ "$CI_PASS" == "$CI_PASS_CONFIRM" && -n "$CI_PASS" ]]; then
+    break
+  else
+    echo "Passwords do not match or are empty. Try again."
   fi
-  echo \
-    "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
-    $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | $SUDO tee /etc/apt/sources.list.d/docker.list >/dev/null
+done
 
-  $SUDO apt-get update
-  $SUDO apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+# -------- SSH public key (optional) --------
 
-  # Allow app user to use docker without sudo (after re-login)
-  $SUDO usermod -aG docker "$APP_USER"
-  echo "Docker installed. You may need to log out and back in for docker group membership to apply."
+read -rp "Use an SSH public key? (y/N): " USE_SSHKEY
+USE_SSHKEY=${USE_SSHKEY:-N}
+
+SSHKEY_FILE=""
+if [[ "$USE_SSHKEY" =~ ^[Yy]$ ]]; then
+  read -rp "Enter path to SSH public key file [~/.ssh/id_rsa.pub]: " SSHKEY_PATH
+  SSHKEY_PATH=${SSHKEY_PATH:-~/.ssh/id_rsa.pub}
+  SSHKEY_PATH=$(eval echo "$SSHKEY_PATH")
+  if [[ ! -f "$SSHKEY_PATH" ]]; then
+    error "SSH key file '$SSHKEY_PATH' not found."
+    exit 1
+  fi
+  SSHKEY_FILE="$SSHKEY_PATH"
+fi
+
+# -------- IP config (cloud-init ipconfig0) --------
+
+read -rp "Use static IP instead of DHCP? (y/N): " USE_STATIC
+USE_STATIC=${USE_STATIC:-N}
+
+VM_IP=""
+VM_CIDR=""
+VM_GW=""
+if [[ "$USE_STATIC" =~ ^[Yy]$ ]]; then
+  read -rp "Static IP (e.g. 10.1.10.50): " VM_IP
+  read -rp "CIDR prefix (e.g. 24 for /24): " VM_CIDR
+  read -rp "Gateway IP (e.g. 10.1.10.1): " VM_GW
+  IP_CONFIG="ip=${VM_IP}/${VM_CIDR},gw=${VM_GW}"
 else
-  echo "Docker already installed."
+  IP_CONFIG="ip=dhcp"
 fi
 
-# --- Optional: Cloudflare Tunnel (cloudflared) ---
-read -rp "Install Cloudflare Tunnel (cloudflared)? [y/N]: " INSTALL_CF
-INSTALL_CF=${INSTALL_CF:-n}
+# -------- Download Ubuntu cloud image --------
 
-if [[ "$INSTALL_CF" =~ ^[Yy]$ ]]; then
-  echo "Installing cloudflared..."
-  $SUDO mkdir -p /etc/apt/keyrings
-  if [[ ! -f /etc/apt/keyrings/cloudflare-main.gpg ]]; then
-    curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | \
-      $SUDO gpg --dearmor -o /etc/apt/keyrings/cloudflare-main.gpg
-  fi
+IMG_URL="https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+echo "Downloading Ubuntu 24.04 (noble) cloud image..."
+TMP_IMG=$(mktemp --suffix=.img)
+curl -L "$IMG_URL" -o "$TMP_IMG"
 
-  echo "deb [signed-by=/etc/apt/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflare-main $(lsb_release -cs) main" | \
-    $SUDO tee /etc/apt/sources.list.d/cloudflare.list >/dev/null
+# -------- Create VM --------
 
-  $SUDO apt-get update
-  $SUDO apt-get install -y cloudflared
+echo "Creating VM $VMID ($VM_NAME)..."
+qm create "$VMID" \
+  --name "$VM_NAME" \
+  --memory "$MEM_MB" \
+  --cores "$CORES" \
+  --net0 "virtio,bridge=${BRIDGE}" \
+  --agent enabled=1 \
+  --ostype l26
 
-  read -rp "Cloudflare Tunnel token (leave blank to skip service install): " CF_TOKEN
-  if [[ -n "$CF_TOKEN" ]]; then
-    $SUDO cloudflared service install "$CF_TOKEN" || echo "cloudflared service install failed; configure manually if needed."
-  else
-    echo "Skipping automatic cloudflared service install."
-  fi
+VM_CREATED=1
+
+echo "Importing disk to storage '$STORAGE'..."
+qm importdisk "$VMID" "$TMP_IMG" "$STORAGE" --format qcow2
+
+# Get the actual volume ID for this VM's imported disk
+# pvesm list output: volid format type size used avail ...
+# We want something like: STORAGE:vm-VMID-disk-0
+VOLID=$(pvesm list "$STORAGE" | awk -v vmid="$VMID" '$1 ~ ("vm-"vmid"-disk-0") {print $1; exit}')
+
+if [[ -z "$VOLID" ]]; then
+  echo "Debug: pvesm list $STORAGE output:" >&2
+  pvesm list "$STORAGE" >&2
+  error "Could not determine imported disk volid on storage '$STORAGE'."
+  exit 1
 fi
 
-# --- Write .env file ---
-ENV_FILE="${NOCODB_DIR}/.env"
+echo "Attaching disk as scsi0 ($VOLID)..."
+qm set "$VMID" --scsihw virtio-scsi-pci --scsi0 "$VOLID"
 
-cat > "$ENV_FILE" <<EOF
-NC_DOMAIN=${NC_DOMAIN}
-NC_DB_NAME=${NC_DB_NAME}
-NC_DB_USER=${NC_DB_USER}
-NC_DB_PASSWORD=${NC_DB_PASSWORD}
-TZ=${TZ}
-EOF
+echo "Resizing disk to ${DISK_GB}G..."
+qm resize "$VMID" scsi0 "${DISK_GB}G"
 
-chown "${APP_USER}:${APP_USER}" "$ENV_FILE"
+echo "Allocating EFI disk..."
+qm set "$VMID" --efidisk0 "${STORAGE}:0,pre-enrolled-keys=1"
 
-echo ".env written at ${ENV_FILE}"
+echo "Adding cloud-init drive..."
+qm set "$VMID" --ide2 "${STORAGE}:cloudinit"
 
-# --- Write docker-compose.yml ---
-COMPOSE_FILE="${NOCODB_DIR}/docker-compose.yml"
+echo "Configuring boot & console..."
+qm set "$VMID" --boot order=scsi0 --bootdisk scsi0
+qm set "$VMID" --serial0 socket --vga serial0
 
-cat > "$COMPOSE_FILE" <<'EOF'
-services:
-  postgres:
-    image: postgres:16
-    container_name: nocodb-postgres
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: ${NC_DB_NAME}
-      POSTGRES_USER: ${NC_DB_USER}
-      POSTGRES_PASSWORD: ${NC_DB_PASSWORD}
-      TZ: ${TZ}
-    volumes:
-      - ./data/postgres:/var/lib/postgresql/data
-    networks:
-      - nocodb-net
+echo "Setting cloud-init user & password..."
+qm set "$VMID" --ciuser "$CI_USER" --cipassword "$CI_PASS"
 
-  redis:
-    image: redis:7
-    container_name: nocodb-redis
-    restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes"]
-    volumes:
-      - ./data/redis:/data
-    networks:
-      - nocodb-net
+if [[ -n "$SSHKEY_FILE" ]]; then
+  echo "Adding SSH public key from $SSHKEY_FILE..."
+  qm set "$VMID" --sshkey "$SSHKEY_FILE"
+fi
 
-  app:
-    image: nocodb/nocodb:latest
-    container_name: nocodb-app
-    restart: unless-stopped
-    depends_on:
-      - postgres
-      - redis
-    env_file:
-      - .env
-    environment:
-      NC_DB: "pg://postgres:5432?u=${NC_DB_USER}&p=${NC_DB_PASSWORD}&d=${NC_DB_NAME}"
-      NC_REDIS_URL: "redis://redis:6379"
-      NC_PUBLIC_URL: "https://${NC_DOMAIN}"
-      TZ: ${TZ}
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.nocodb.rule=Host(`${NC_DOMAIN}`)"
-      - "traefik.http.routers.nocodb.entrypoints=web"
-    networks:
-      - nocodb-net
+echo "Configuring IP (${IP_CONFIG})..."
+qm set "$VMID" --ipconfig0 "$IP_CONFIG"
 
-  traefik:
-    image: traefik:v3.1
-    container_name: nocodb-traefik
-    restart: unless-stopped
-    command:
-      - "--api.dashboard=true"
-      - "--api.insecure=true"
-      - "--providers.docker=true"
-      - "--providers.docker.exposedByDefault=false"
-      - "--entrypoints.web.address=:80"
-    ports:
-      - "80:80"
-      - "8080:8080"
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-    networks:
-      - nocodb-net
+echo "Final VM config:"
+qm config "$VMID"
 
-  watchtower:
-    image: containrrr/watchtower
-    container_name: nocodb-watchtower
-    restart: unless-stopped
-    command: "--cleanup --label-enable --interval 3600"
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
+echo "Starting VM $VMID..."
+qm start "$VMID"
 
-networks:
-  nocodb-net:
-    driver: bridge
-EOF
-
-chown "${APP_USER}:${APP_USER}" "$COMPOSE_FILE"
-
-echo "docker-compose.yml written at ${COMPOSE_FILE}"
-
-# --- Bring up the stack ---
-
-cd "$NOCODB_DIR"
-echo "Starting NocoDB stack with: docker compose up -d"
-$SUDO docker compose pull
-$SUDO docker compose up -d
+# If we got here, everything is good – disable cleanup destroy
+VM_CREATED=0
 
 echo
-echo "=== Done ==="
-echo "NocoDB stack is starting."
-echo "  - If DNS is set:   http://${NC_DOMAIN}  (or https via Cloudflare proxy)"
-echo "  - Local (VM IP):   http://<vm-ip> (Traefik on port 80)"
-echo
-echo "You can manage containers with:   docker ps   /   docker compose logs -f"
+echo "============================================================"
+echo " VM $VMID ($VM_NAME) created and started successfully."
+echo "------------------------------------------------------------"
+echo "  Username:   $CI_USER"
+echo "  Password:   (the one you entered)"
+echo "  Network:    $BRIDGE"
+if [[ "$USE_STATIC" =~ ^[Yy]$ && -n "$VM_IP" ]]; then
+  echo "  IP (static): $VM_IP/$VM_CIDR (gw: $VM_GW)"
+  echo
+  echo "You can SSH in once cloud-init finishes with:"
+  echo "  ssh ${CI_USER}@${VM_IP}"
+else
+  echo "  IP: DHCP (check your DHCP server or run from Proxmox console:"
+  echo "       'ip a' inside the VM to see the address)"
+  echo
+  echo "Once you know the IP, SSH in with:"
+  echo "  ssh ${CI_USER}@<VM_IP>"
+fi
+
+if [[ -n "$SSHKEY_FILE" ]]; then
+  echo
+  echo "SSH key-based auth is enabled using key from:"
+  echo "  $SSHKEY_FILE"
+else
+  echo
+  echo "Password-based SSH auth should work with the username & password above."
+fi
+echo "============================================================"
