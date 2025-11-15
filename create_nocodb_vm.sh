@@ -1,135 +1,178 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "=== Pal Forge | NocoDB Proxmox VM Creator ==="
-echo "This script must be run on your Proxmox host as root."
+### ===========================================================================
+###  Pal Forge – NocoDB Proxmox VM Creator
+###  Creates a VM using Ubuntu 24.04 AMD64 cloud image + cloud-init
+### ===========================================================================
+
+if [[ $EUID -ne 0 ]]; then
+  echo "⚠️  Run this script as root: sudo -i"
+  exit 1
+fi
+
+# Check dependencies
+for cmd in qm pvesm wget; do
+  if ! command -v "$cmd" &>/dev/null; then
+    echo "❌ Missing required command: $cmd"
+    exit 1
+  fi
+done
+
+echo "=== Pal Forge – NocoDB VM Creator ==="
 echo
 
-if [[ "$(id -u)" -ne 0 ]]; then
-  echo "ERROR: Please run this script as root on the Proxmox host (e.g. via sudo)."
+### ---------------------------------------------------------------------------
+### USER INPUT
+### ---------------------------------------------------------------------------
+
+DEFAULT_NODE="$(hostname)"
+read -rp "Proxmox node name [${DEFAULT_NODE}]: " NODE
+NODE="${NODE:-$DEFAULT_NODE}"
+
+read -rp "VM ID [9001]: " VMID
+VMID="${VMID:-9001}"
+
+read -rp "VM Name [nocodb-vm]: " VMNAME
+VMNAME="${VMNAME:-nocodb-vm}"
+
+read -rp "Number of vCPUs [2]: " VCPUS
+VCPUS="${VCPUS:-2}"
+
+read -rp "RAM in GB [4]: " RAM_GB
+RAM_GB="${RAM_GB:-4}"
+RAM_MB=$(( RAM_GB * 1024 ))
+
+read -rp "Disk size in GB [40]: " DISK_GB
+DISK_GB="${DISK_GB:-40}"
+
+### Storage selection
+echo
+echo "Detecting Proxmox storage pools..."
+mapfile -t STORAGES < <(pvesm status -content images | awk 'NR>1 {print $1}')
+
+if [[ ${#STORAGES[@]} -eq 0 ]]; then
+  echo "❌ No storage pools with content=images found."
   exit 1
 fi
 
-read_with_default() {
-  local prompt="$1"
-  local default="$2"
-  local var
-  read -rp "$prompt [$default]: " var
-  echo "${var:-$default}"
-}
+echo "Available storage pools:"
+for i in "${!STORAGES[@]}"; do
+  echo "  $((i+1))) ${STORAGES[$i]}"
+done
 
-# --- Collect settings ---
+read -rp "Select storage for main disk [1]: " DISK_IDX
+DISK_IDX="${DISK_IDX:-1}"
+DISK_STORAGE="${STORAGES[$((DISK_IDX-1))]}"
 
-VMID=$(read_with_default "VM ID" "120")
-VM_NAME=$(read_with_default "VM Name" "nocodb-vm")
-TEMPLATE_ID=$(read_with_default "Cloud-init template ID (Ubuntu 22.04/24.04)" "9000")
-STORAGE=$(read_with_default "Storage (for disk & cloud-init)" "local-lvm")
-DISK_SIZE=$(read_with_default "Disk size" "40G")
-CORES=$(read_with_default "CPU cores" "2")
-MEMORY=$(read_with_default "Memory (MB)" "4096")
-BRIDGE=$(read_with_default "Bridge" "vmbr0")
-VLAN_TAG=$(read_with_default "VLAN tag (empty for none)" "")
-IPADDR=$(read_with_default "VM IP/CIDR" "192.168.1.50/24")
-GATEWAY=$(read_with_default "Gateway" "192.168.1.1")
-CI_USER=$(read_with_default "Cloud-init username" "abell")
-TIMEZONE=$(read_with_default "Timezone" "America/Denver")
-
-SSH_KEY_PATH=$(read_with_default "Path to SSH public key" "$HOME/.ssh/id_ed25519.pub")
-if [[ ! -f "$SSH_KEY_PATH" ]]; then
-  echo "ERROR: SSH key not found at $SSH_KEY_PATH"
-  exit 1
+read -rp "Use same storage for cloud-init disk? [Y/n]: " SAME
+if [[ "$SAME" =~ ^[Nn]$ ]]; then
+  read -rp "Select storage for cloud-init disk [1]: " CI_IDX
+  CI_IDX="${CI_IDX:-1}"
+  CI_STORAGE="${STORAGES[$((CI_IDX-1))]}"
+else
+  CI_STORAGE="$DISK_STORAGE"
 fi
-SSH_KEY_CONTENT=$(<"$SSH_KEY_PATH")
 
-SNIPPET_DIR="/var/lib/vz/snippets"
-mkdir -p "$SNIPPET_DIR"
-SNIPPET_NAME="nocodb-cloudinit-${VMID}.yaml"
-USERDATA_PATH="${SNIPPET_DIR}/${SNIPPET_NAME}"
+### SSH Key
+echo
+read -rp "Inject SSH public key? [y/N]: " USEKEY
+
+USE_SSH_KEY="no"
+SSH_KEY_FILE=""
+if [[ "$USEKEY" =~ ^[Yy]$ ]]; then
+  USE_SSH_KEY="yes"
+  DEFAULT_KEY="$HOME/.ssh/id_rsa.pub"
+  read -rp "Path to SSH public key [$DEFAULT_KEY]: " SSH_KEY_FILE
+  SSH_KEY_FILE="${SSH_KEY_FILE:-$DEFAULT_KEY}"
+  SSH_KEY_FILE="${SSH_KEY_FILE/#\~/$HOME}"
+
+  if [[ ! -f "$SSH_KEY_FILE" ]]; then
+    echo "❌ SSH key file not found."
+    exit 1
+  fi
+fi
+
+### ---------------------------------------------------------------------------
+### CONFIRM
+### ---------------------------------------------------------------------------
 
 echo
 echo "=== Summary ==="
-echo "VMID:       $VMID"
-echo "Name:       $VM_NAME"
-echo "Template:   $TEMPLATE_ID"
-echo "Storage:    $STORAGE"
-echo "Disk:       $DISK_SIZE"
-echo "CPU:        $CORES"
-echo "RAM:        $MEMORY MB"
-echo "Bridge:     $BRIDGE"
-echo "VLAN tag:   ${VLAN_TAG:-<none>}"
-echo "IP:         $IPADDR"
-echo "Gateway:    $GATEWAY"
-echo "User:       $CI_USER"
-echo "Timezone:   $TIMEZONE"
-echo "SSH key:    $SSH_KEY_PATH"
-echo "Cloud-init: $USERDATA_PATH"
+echo "VM ID:                $VMID"
+echo "Name:                 $VMNAME"
+echo "vCPUs:                $VCPUS"
+echo "RAM:                  ${RAM_GB}GB"
+echo "Disk Size:            ${DISK_GB}GB"
+echo "Main Disk Storage:    $DISK_STORAGE"
+echo "Cloud-Init Storage:   $CI_STORAGE"
+echo "SSH Key Injection:    $USE_SSH_KEY"
 echo
 
-read -rp "Proceed and create VM? [y/N]: " CONFIRM
-CONFIRM=${CONFIRM:-n}
-if [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]]; then
-  echo "Aborting."
+read -rp "Proceed? [y/N]: " GO
+if ! [[ "$GO" =~ ^[Yy]$ ]]; then
+  echo "Aborted."
   exit 0
 fi
 
-# --- Create cloud-init user-data snippet ---
+### ---------------------------------------------------------------------------
+### DOWNLOAD CLOUD IMAGE (AMD64)
+### ---------------------------------------------------------------------------
 
-cat > "$USERDATA_PATH" <<EOF
-#cloud-config
-users:
-  - name: ${CI_USER}
-    groups: sudo
-    shell: /bin/bash
-    sudo: ALL=(ALL) NOPASSWD:ALL
-    ssh_authorized_keys:
-      - ${SSH_KEY_CONTENT}
+IMG_DIR="/var/lib/vz/template/iso"
+mkdir -p "$IMG_DIR"
 
-timezone: ${TIMEZONE}
+AMD64_URL="https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+LOCAL_IMG="$IMG_DIR/ubuntu-24.04-amd64.img"
 
-package_update: true
-package_upgrade: true
+echo "Downloading Ubuntu 24.04 AMD64 cloud image..."
+wget -O "$LOCAL_IMG" "$AMD64_URL"
 
-runcmd:
-  - [bash, -c, "echo 'Cloud-init complete for ${CI_USER}'"]
-EOF
+### ---------------------------------------------------------------------------
+### CREATE VM
+### ---------------------------------------------------------------------------
 
-echo "Wrote cloud-init user-data to: $USERDATA_PATH"
+echo "Creating VM $VMID..."
 
-SNIPPET_STORAGE="local"   # default Proxmox storage for snippets
-
-# --- Create VM from template ---
-
-echo "Cloning template ${TEMPLATE_ID} to VM ${VMID}..."
-qm clone "$TEMPLATE_ID" "$VMID" --name "$VM_NAME" --full true --storage "$STORAGE"
-
-echo "Configuring VM hardware and cloud-init..."
-NET_CONF="virtio,bridge=${BRIDGE}"
-if [[ -n "$VLAN_TAG" ]]; then
-  NET_CONF="${NET_CONF},tag=${VLAN_TAG}"
+if qm status "$VMID" &>/dev/null; then
+  echo "❌ VM ID $VMID already exists."
+  exit 1
 fi
 
-qm set "$VMID" \
-  --cores "$CORES" \
-  --memory "$MEMORY" \
-  --net0 "$NET_CONF" \
-  --ipconfig0 "ip=${IPADDR},gw=${GATEWAY}"
+qm create "$VMID" \
+  --name "$VMNAME" \
+  --memory "$RAM_MB" \
+  --cores "$VCPUS" \
+  --net0 "virtio,bridge=vmbr0" \
+  --agent 1 \
+  --ostype l26 \
+  --scsihw virtio-scsi-pci \
+  --bios ovmf \
+  --boot order=scsi0
 
-# Attach cloud-init drive & snippet
+echo "Importing cloud-image disk..."
+qm importdisk "$VMID" "$LOCAL_IMG" "$DISK_STORAGE" --format qcow2
+
 qm set "$VMID" \
-  --ide2 "${STORAGE}:cloudinit" \
-  --cicustom "user=${SNIPPET_STORAGE}:snippets/${SNIPPET_NAME}" \
+  --scsi0 "${DISK_STORAGE}:vm-${VMID}-disk-0" \
   --serial0 socket \
-  --boot c \
-  --bootdisk scsi0
+  --vga serial0
 
-# Resize disk
-qm resize "$VMID" scsi0 "$DISK_SIZE"
+echo "Adding cloud-init drive..."
+qm set "$VMID" \
+  --ide2 "${CI_STORAGE}:cloudinit" \
+  --ciuser nocodb \
+  --cipassword nocodb
 
-echo "Starting VM ${VMID}..."
-qm start "$VMID"
+if [[ "$USE_SSH_KEY" == "yes" ]]; then
+  qm set "$VMID" --sshkey "$SSH_KEY_FILE"
+fi
 
+echo "=== VM CREATED SUCCESSFULLY ==="
 echo
-echo "=== Done ==="
-echo "VM ${VMID} (${VM_NAME}) created and started."
-echo "SSH once it's up:  ssh ${CI_USER}@<${IPADDR%/*}>"
-echo "Then run:  ./setup_nocodb.sh  (inside the VM)"
+echo "Start the VM:"
+echo "  qm start $VMID"
+echo
+echo "Then SSH into it and run:"
+echo "  bash <(curl -sSL https://raw.githubusercontent.com/abellpfs/palforge-nocodb-installer/main/setup_nocodb.sh)"
+echo
