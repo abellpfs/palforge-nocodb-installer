@@ -6,8 +6,11 @@ set -euo pipefail
 
 # ------------- Globals -------------
 
-TMP_IMG=""
 VM_CREATED=0
+IMAGE_PATH=""
+
+CACHE_DIR="/var/lib/pf-vmfactory/images"
+CACHE_MAX_AGE_DAYS=30
 
 # ------------- Helpers -------------
 
@@ -16,10 +19,7 @@ err() {
 }
 
 cleanup() {
-  if [[ -n "${TMP_IMG:-}" && -f "$TMP_IMG" ]]; then
-    echo "Cleaning up temporary image: $TMP_IMG"
-    rm -f "$TMP_IMG"
-  fi
+  # If VM was partially created and something failed, destroy it
   if [[ "${VM_CREATED:-0}" -eq 1 ]]; then
     echo "An error occurred. Destroying VM $VMID..."
     qm destroy "$VMID" --purge || true
@@ -62,6 +62,28 @@ yes_no_default() {
   else
     return 1
   fi
+}
+
+is_positive_int() {
+  [[ "$1" =~ ^[0-9]+$ ]] && (( "$1" > 0 ))
+}
+
+is_cidr() {
+  [[ "$1" =~ ^[0-9]+$ ]] && (( "$1" >= 0 && "$1" <= 32 ))
+}
+
+is_ip() {
+  local ip="$1"
+  if [[ ! "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    return 1
+  fi
+  IFS='.' read -r o1 o2 o3 o4 <<< "$ip"
+  for o in "$o1" "$o2" "$o3" "$o4"; do
+    if (( o < 0 || o > 255 )); then
+      return 1
+    fi
+  done
+  return 0
 }
 
 # Simple text progress bar that works in xterm.js
@@ -111,13 +133,48 @@ download_image_with_progress() {
   if ! wait "$curl_pid"; then
     echo
     err "Image download failed."
+    rm -f "$outfile" || true
     exit 1
   fi
 
   # Finish at 100% and show a clean 'Done' line
   progress_bar 100
-  # Overwrite with a nice Done line
   printf "\rDownloading Image | %-30s |\n" "Done"
+}
+
+# Get cached image or download a fresh one (with expiration)
+get_or_download_image() {
+  local url="$1"
+  local cache_dir="$2"
+  local max_days="$3"
+
+  mkdir -p "$cache_dir"
+
+  local filename
+  filename="$(basename "$url")"
+  local img="${cache_dir}/${filename}"
+  local stamp="${img}.stamp"
+
+  # If cached and stamp exists, check age
+  if [[ -f "$img" && -f "$stamp" ]]; then
+    local now ts age_days
+    now=$(date +%s)
+    ts=$(cat "$stamp" 2>/dev/null || echo 0)
+    if [[ "$ts" =~ ^[0-9]+$ ]]; then
+      age_days=$(( (now - ts) / 86400 ))
+      if (( age_days <= max_days )); then
+        echo "$img"
+        return
+      fi
+    fi
+    # Too old or bad stamp, purge
+    rm -f "$img" "$stamp"
+  fi
+
+  # Need a fresh download
+  download_image_with_progress "$url" "$img"
+  date +%s > "$stamp"
+  echo "$img"
 }
 
 # ------------- Pre-flight checks -------------
@@ -132,6 +189,53 @@ require_cmd qm pvesm curl awk sed grep
 echo "=========================================="
 echo " Pal Forge IT - Proxmox VM Factory"
 echo "=========================================="
+echo
+
+# ------------- Host Selection -------------
+
+CURRENT_NODE=$(hostname)
+if [[ -d /etc/pve/nodes ]]; then
+  mapfile -t AVAILABLE_NODES < <(ls -1 /etc/pve/nodes)
+else
+  AVAILABLE_NODES=("$CURRENT_NODE")
+fi
+
+if ((${#AVAILABLE_NODES[@]} == 0)); then
+  err "No Proxmox nodes found under /etc/pve/nodes."
+  exit 1
+fi
+
+echo "Available Proxmox Hosts:"
+for i in "${!AVAILABLE_NODES[@]}"; do
+  idx=$((i+1))
+  echo "  $idx) ${AVAILABLE_NODES[$i]}"
+done
+
+read -r -p "Select host to create VM on [$CURRENT_NODE]: " HOST_CHOICE
+if [[ -z "$HOST_CHOICE" ]]; then
+  TARGET_NODE="$CURRENT_NODE"
+else
+  if ! [[ "$HOST_CHOICE" =~ ^[0-9]+$ ]] || (( HOST_CHOICE < 1 || HOST_CHOICE > ${#AVAILABLE_NODES[@]} )); then
+    err "Invalid host choice."
+    exit 1
+  fi
+  TARGET_NODE="${AVAILABLE_NODES[$((HOST_CHOICE-1))]}"
+fi
+
+echo "Selected Host: $TARGET_NODE"
+
+# Ensure script is executed on the correct node
+if [[ "$TARGET_NODE" != "$CURRENT_NODE" ]]; then
+  echo
+  echo "ERROR: You selected host '$TARGET_NODE' but this script is running on '$CURRENT_NODE'."
+  echo
+  echo "Please SSH into $TARGET_NODE and run the script there:"
+  echo "  ssh root@$TARGET_NODE"
+  echo
+  exit 1
+fi
+
+echo "Host verified: running on correct node ($TARGET_NODE)."
 echo
 
 # ------------- Environment / role / naming -------------
@@ -240,6 +344,19 @@ CORES=$(read_default "CPU cores" "$DEF_CORES")
 MEM_GB=$(read_default "Memory (in GB)" "$DEF_MEM_GB")
 DISK_GB=$(read_default "Disk size (in GB)" "$DEF_DISK_GB")
 
+if ! is_positive_int "$CORES"; then
+  err "CPU cores must be a positive integer."
+  exit 1
+fi
+if ! is_positive_int "$MEM_GB"; then
+  err "Memory (GB) must be a positive integer."
+  exit 1
+fi
+if ! is_positive_int "$DISK_GB"; then
+  err "Disk size (GB) must be a positive integer."
+  exit 1
+fi
+
 # Convert memory to MB
 MEMORY=$((MEM_GB * 1024))
 
@@ -252,6 +369,11 @@ pvesm status
 echo
 echo "Select storage for disk & cloud-init:"
 mapfile -t STORAGE_NAMES < <(pvesm status | awk 'NR>1 {print $1}')
+if ((${#STORAGE_NAMES[@]} == 0)); then
+  err "No storages found from 'pvesm status'."
+  exit 1
+fi
+
 for i in "${!STORAGE_NAMES[@]}"; do
   idx=$((i+1))
   printf "  %d) %s\n" "$idx" "${STORAGE_NAMES[$i]}"
@@ -279,17 +401,19 @@ read -r -p "Choice [1]: " OS_CHOICE
 case "$OS_CHOICE" in
   2)
     IMAGE_URL="https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img"
+    OS_NAME="Ubuntu 22.04 (jammy)"
     ;;
   *)
     IMAGE_URL="https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+    OS_NAME="Ubuntu 24.04 (noble)"
     ;;
 esac
 
 echo "Using image: $IMAGE_URL"
+echo
 
 # ------------- Auth mode & user -------------
 
-echo
 VM_USER=$(read_default "VM username" "pfsadmin")
 
 echo
@@ -304,11 +428,13 @@ VM_PASS=""
 SSH_KEY_PATH=""
 SSH_KEY_DATA=""
 SSH_PW_AUTH="true"  # default
+AUTH_MODE_HUMAN=""
 
 case "$AUTH_CHOICE" in
   2)
     # SSH key only
     SSH_PW_AUTH="false"
+    AUTH_MODE_HUMAN="SSH key only"
     if yes_no_default "Use default SSH public key at ~/.ssh/id_rsa.pub?" "y"; then
       SSH_KEY_PATH="${HOME}/.ssh/id_rsa.pub"
     else
@@ -324,6 +450,7 @@ case "$AUTH_CHOICE" in
   3)
     # SSH key + password
     SSH_PW_AUTH="true"
+    AUTH_MODE_HUMAN="SSH key + password"
     if yes_no_default "Use default SSH public key at ~/.ssh/id_rsa.pub?" "y"; then
       SSH_KEY_PATH="${HOME}/.ssh/id_rsa.pub"
     else
@@ -347,6 +474,7 @@ case "$AUTH_CHOICE" in
   *)
     # Password only
     SSH_PW_AUTH="true"
+    AUTH_MODE_HUMAN="Password only"
     read -s -p "VM password: " VM_PASS
     echo
     read -s -p "Confirm password: " VM_PASS2
@@ -363,19 +491,60 @@ esac
 echo
 if yes_no_default "Use static IP instead of DHCP?" "n"; then
   read -r -p "Static IP (e.g. 10.1.10.200): " STATIC_IP
+  if ! is_ip "$STATIC_IP"; then
+    err "Invalid Static IP format."
+    exit 1
+  fi
   read -r -p "CIDR prefix (e.g. 24 for /24): " CIDR
+  if ! is_cidr "$CIDR"; then
+    err "Invalid CIDR prefix. Must be 0–32."
+    exit 1
+  fi
   read -r -p "Gateway IP (e.g. 10.1.10.1): " GATEWAY
+  if ! is_ip "$GATEWAY"; then
+    err "Invalid Gateway IP format."
+    exit 1
+  fi
   IPCONFIG0="ip=${STATIC_IP}/${CIDR},gw=${GATEWAY}"
+  NET_DESC="Static (${STATIC_IP}/${CIDR}, gw ${GATEWAY})"
 else
   IPCONFIG0="ip=dhcp"
+  NET_DESC="DHCP"
 fi
 
-# ------------- Download cloud image -------------
+# ------------- Pre-flight Summary & Confirm -------------
 
 echo
-echo "Downloading Ubuntu cloud image..."
-TMP_IMG="$(mktemp --suffix=.img)"
-download_image_with_progress "$IMAGE_URL" "$TMP_IMG"
+echo "=========================================="
+echo " VM Creation Summary (Review Below)"
+echo "------------------------------------------"
+echo " Host        : $TARGET_NODE"
+echo " VM ID       : $VMID"
+echo " Name        : $VM_NAME"
+echo " Environment : $ENV"
+echo " Role        : $ROLE"
+echo " Site        : $SITE"
+echo " OS          : $OS_NAME"
+echo " CPU cores   : $CORES"
+echo " Memory      : ${MEM_GB} GB"
+echo " Disk        : ${DISK_GB} GB"
+echo " Storage     : $STORAGE"
+echo " Bridge      : $BRIDGE"
+echo " Network     : $NET_DESC"
+echo " Username    : $VM_USER"
+echo " Auth mode   : $AUTH_MODE_HUMAN"
+echo "=========================================="
+if ! yes_no_default "Proceed with VM creation?" "y"; then
+  echo "Aborting by user request."
+  exit 0
+fi
+
+# ------------- Download / Cache cloud image -------------
+
+echo
+echo "Preparing Ubuntu cloud image (cache: $CACHE_DIR, max age: ${CACHE_MAX_AGE_DAYS}d)..."
+IMAGE_PATH="$(get_or_download_image "$IMAGE_URL" "$CACHE_DIR" "$CACHE_MAX_AGE_DAYS")"
+echo "Using image file: $IMAGE_PATH"
 
 # ------------- Create VM -------------
 
@@ -391,7 +560,7 @@ qm create "$VMID" \
 VM_CREATED=1
 
 echo "Importing disk to storage '$STORAGE'..."
-qm importdisk "$VMID" "$TMP_IMG" "$STORAGE" --format qcow2
+qm importdisk "$VMID" "$IMAGE_PATH" "$STORAGE" --format qcow2
 
 # Find the imported disk volid
 DISK_VOLID="$(pvesm list "$STORAGE" | awk -v vmid="$VMID" '$1 ~ ("vm-"vmid"-disk-0") {print $1; exit}')"
@@ -480,17 +649,19 @@ echo
 echo "=========================================="
 echo " VM $VMID ($VM_NAME) created successfully"
 echo "------------------------------------------"
+echo " Host        : $TARGET_NODE"
 echo " Environment : $ENV"
 echo " Role        : $ROLE"
 echo " Site        : $SITE"
+echo " OS          : $OS_NAME"
 echo " CPU cores   : $CORES"
 echo " Memory      : ${MEM_GB} GB"
 echo " Disk        : ${DISK_GB} GB"
 echo " Storage     : $STORAGE"
 echo " Bridge      : $BRIDGE"
 echo " Username    : $VM_USER"
-echo " Auth mode   : $(case "$AUTH_CHOICE" in 1) echo 'Password only' ;; 2) echo 'SSH key only' ;; 3) echo 'SSH key + password' ;; esac)"
-echo " IP config   : $IPCONFIG0"
+echo " Auth mode   : $AUTH_MODE_HUMAN"
+echo " Network     : $NET_DESC"
 echo " Tags        : $TAGS"
 echo "=========================================="
 echo "You can connect after cloud-init finishes."
