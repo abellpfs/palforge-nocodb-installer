@@ -2,200 +2,183 @@
 set -euo pipefail
 
 ########################################
-# NocoDB + Traefik Setup (VM-friendly)
+# NocoDB + Traefik Setup / Installer
+# - Installs Docker if missing
+# - Ensures daemon.json min-api-version
+# - Writes docker-compose.yml
+# - Reuses existing config if desired
 ########################################
 
-#----- Helpers -----#
-require_root() {
-  if [[ "${EUID}" -ne 0 ]]; then
-    echo "[ERROR] This script must be run as root (or via sudo)." >&2
-    exit 1
-  fi
-}
-
-ensure_base_dir() {
-  BASE_DIR="/opt/nocodb"
-  mkdir -p "${BASE_DIR}"
-  cd "${BASE_DIR}"
-  echo "[INFO] Working directory: ${BASE_DIR}"
-}
-
-ensure_docker() {
-  if command -v docker >/dev/null 2>&1; then
-    echo "[INFO] Docker is already installed."
-    return
-  fi
-
-  echo "[INFO] Docker not found. Installing Docker (docker.io + compose plugin)..."
-
-  apt-get update -y
-  apt-get install -y \
-    ca-certificates \
-    curl \
-    gnupg \
-    lsb-release \
-    jq \
-    docker.io \
-    docker-compose-plugin
-
-  systemctl enable docker
-  systemctl restart docker
-
-  if ! command -v docker >/dev/null 2>&1; then
-    echo "[ERROR] Docker installation appears to have failed." >&2
-    exit 1
-  fi
-
-  echo "[INFO] Docker installed successfully."
-}
-
-generate_password() {
-  openssl rand -hex 16
-}
-
-########################################
-# Main Script
-########################################
-
-require_root
-ensure_base_dir
-ensure_docker
+BASE_DIR="/opt/nocodb"
+DEFAULT_DOMAIN="sales.palforge.it"
+DEFAULT_HTTP_PORT="80"
 
 echo "======================================="
-echo "  NocoDB + Traefik Setup (VM version)  "
+echo "  NocoDB + Traefik Setup (Pal Forge)   "
 echo "======================================="
 
-# Default values (can be overridden by existing compose)
-NC_HOST_DEFAULT="sales.palforge.it"
-TRAEFIK_HTTP_PORT_DEFAULT="80"
-NC_DB_PASSWORD_DEFAULT=""
-
-if [[ -f docker-compose.yml ]]; then
-  echo "[INFO] Existing docker-compose.yml detected in $(pwd)."
-
-  # Try to extract existing host
-  EXISTING_HOST="$(grep -E 'traefik.http.routers.nocodb.rule=Host' docker-compose.yml 2>/dev/null \
-    | sed -E 's/.*Host\(`([^`]+)`.*/\1/' || true)"
-  if [[ -n "${EXISTING_HOST}" ]]; then
-    NC_HOST_DEFAULT="${EXISTING_HOST}"
-    echo "[INFO] Detected existing domain: ${NC_HOST_DEFAULT}"
-  fi
-
-  # Try to extract existing HTTP port
-  EXISTING_PORT="$(grep -E '"[0-9]+:80"' docker-compose.yml 2>/dev/null \
-    | head -n1 \
-    | sed -E 's/.*"([0-9]+):80".*/\1/' || true)"
-  if [[ -n "${EXISTING_PORT}" ]]; then
-    TRAEFIK_HTTP_PORT_DEFAULT="${EXISTING_PORT}"
-    echo "[INFO] Detected existing HTTP port: ${TRAEFIK_HTTP_PORT_DEFAULT}"
-  fi
-
-  # Try to extract existing DB password (do NOT echo it back)
-  EXISTING_DB_PW="$(grep -E 'POSTGRES_PASSWORD=' docker-compose.yml 2>/dev/null \
-    | sed -E 's/.*POSTGRES_PASSWORD=([^"]+).*/\1/' || true)"
-  if [[ -n "${EXISTING_DB_PW}" ]]; then
-    NC_DB_PASSWORD_DEFAULT="${EXISTING_DB_PW}"
-    echo "[INFO] Detected existing Postgres password (will be reused if left blank)."
-  fi
-
-  echo
-  read -rp "Existing configuration found. Do you want to CHANGE domain/port/password? [y/N]: " CHANGE_CFG
-  CHANGE_CFG=${CHANGE_CFG:-n}
-else
-  CHANGE_CFG="y"
+# Must be root
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  echo "[ERROR] This script must be run as root (or via sudo)." >&2
+  exit 1
 fi
 
-NC_HOST=""
-TRAEFIK_HTTP_PORT=""
-NC_DB_PASSWORD=""
+# Ensure base dir
+mkdir -p "${BASE_DIR}"
+cd "${BASE_DIR}"
 
-if [[ "${CHANGE_CFG}" == "y" || "${CHANGE_CFG}" == "Y" ]]; then
-  echo
-  echo "[INFO] We will collect configuration for NocoDB and its services."
+########################################
+# Docker install / check
+########################################
+if ! command -v docker >/dev/null 2>&1; then
+  echo "[INFO] Docker not found. Installing via get.docker.com..."
+  curl -fsSL https://get.docker.com | sh
 
-  # Domain
-  read -rp "Domain for NocoDB [${NC_HOST_DEFAULT}]: " NC_HOST
-  NC_HOST=${NC_HOST:-${NC_HOST_DEFAULT}}
-
-  # HTTP Port
-  read -rp "External HTTP port for Traefik [${TRAEFIK_HTTP_PORT_DEFAULT}]: " TRAEFIK_HTTP_PORT
-  TRAEFIK_HTTP_PORT=${TRAEFIK_HTTP_PORT:-${TRAEFIK_HTTP_PORT_DEFAULT}}
-
-  # DB Password
-  echo
-  if [[ -n "${NC_DB_PASSWORD_DEFAULT}" ]]; then
-    echo "Postgres password for 'nocodb' user:"
-    echo "  - Leave blank to REUSE existing password"
-    echo "  - Or type a new password to change it"
-    read -rsp "Postgres password [reuse existing]: " NC_DB_PASSWORD
-    echo
-
-    if [[ -z "${NC_DB_PASSWORD}" ]]; then
-      NC_DB_PASSWORD="${NC_DB_PASSWORD_DEFAULT}"
-      echo "[INFO] Reusing existing Postgres password."
-    fi
-  else
-    read -rsp "Postgres password for 'nocodb' user [auto-generate]: " NC_DB_PASSWORD
-    echo
-    if [[ -z "${NC_DB_PASSWORD}" ]]; then
-      NC_DB_PASSWORD="$(generate_password)"
-      echo "[INFO] Generated DB password: ${NC_DB_PASSWORD}"
-    fi
-  fi
+  echo "[INFO] Enabling and starting Docker service..."
+  systemctl enable docker >/dev/null 2>&1 || true
+  systemctl restart docker || systemctl start docker
 else
-  # Reuse existing settings without prompting (except for missing values)
-  NC_HOST="${NC_HOST_DEFAULT}"
-  TRAEFIK_HTTP_PORT="${TRAEFIK_HTTP_PORT_DEFAULT}"
+  echo "[INFO] Docker is already installed."
+fi
 
-  if [[ -n "${NC_DB_PASSWORD_DEFAULT}" ]]; then
-    NC_DB_PASSWORD="${NC_DB_PASSWORD_DEFAULT}"
+# Ensure docker is actually working
+if ! docker version >/dev/null 2>&1; then
+  echo "[ERROR] Docker appears installed but 'docker version' failed."
+  exit 1
+fi
+
+########################################
+# Ensure /etc/docker/daemon.json (min-api-version)
+########################################
+if [[ ! -d /etc/docker ]]; then
+  mkdir -p /etc/docker
+fi
+
+if [[ ! -f /etc/docker/daemon.json ]]; then
+  echo "[INFO] Creating /etc/docker/daemon.json with min-api-version..."
+  cat >/etc/docker/daemon.json <<'EOF'
+{
+  "min-api-version": "1.24",
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
+  }
+}
+EOF
+  systemctl restart docker || true
+else
+  echo "[INFO] /etc/docker/daemon.json already exists; not modifying it."
+  echo "       (Ensure it has 'min-api-version' set the way you like.)"
+fi
+
+########################################
+# Determine docker compose command
+########################################
+DOCKER_COMPOSE_CMD="docker compose"
+if ! ${DOCKER_COMPOSE_CMD} version >/dev/null 2>&1; then
+  if command -v docker-compose >/dev/null 2>&1; then
+    DOCKER_COMPOSE_CMD="docker-compose"
   else
-    NC_DB_PASSWORD="$(generate_password)"
-    echo "[INFO] No existing DB password found; generated new one: ${NC_DB_PASSWORD}"
+    echo "[ERROR] Neither 'docker compose' nor 'docker-compose' is available." >&2
+    echo "        Docker install might have failed. Check Docker and rerun." >&2
+    exit 1
   fi
+fi
+echo "[INFO] Using compose command: ${DOCKER_COMPOSE_CMD}"
+
+########################################
+# Existing config detection
+########################################
+EXISTING_COMPOSE=false
+CURRENT_DOMAIN="${DEFAULT_DOMAIN}"
+
+if [[ -f "${BASE_DIR}/docker-compose.yml" ]]; then
+  EXISTING_COMPOSE=true
+  echo "[INFO] Existing docker-compose.yml detected at ${BASE_DIR}/docker-compose.yml"
+
+  # Try to extract current hostname from existing compose
+  existing_rule="$(grep -E 'traefik.http.routers.nocodb.rule=Host' docker-compose.yml || true)"
+  if [[ -n "${existing_rule}" ]]; then
+    # Expect something like: traefik.http.routers.nocodb.rule=Host(`sales.palforge.it`)
+    CURRENT_DOMAIN="$(echo "${existing_rule}" | sed -E 's/.*Host\(`([^`]+)`\).*/\1/')"
+  fi
+
+  echo "  Detected current domain: ${CURRENT_DOMAIN}"
+  echo
+  read -rp "Do you want to KEEP the current config and just (re)start the stack? [Y/n]: " REUSE
+  REUSE=${REUSE:-Y}
+  if [[ "${REUSE}" =~ ^[Yy]$ ]]; then
+    echo "[INFO] Reusing existing configuration. Bringing stack up..."
+    ${DOCKER_COMPOSE_CMD} up -d
+    echo
+    echo "======================================="
+    echo "  Stack restarted with existing config "
+    echo "  NocoDB should be at: https://${CURRENT_DOMAIN}"
+    echo "======================================="
+    exit 0
+  else
+    echo "[INFO] Will rebuild docker-compose.yml (domain, ports, DB password, etc.)."
+    echo "       If you already have data in Postgres, changing DB password may break it."
+  fi
+fi
+
+########################################
+# New / updated configuration prompts
+########################################
+echo
+echo "[INFO] We will now collect configuration for NocoDB and Traefik."
+
+read -rp "Domain for NocoDB [${CURRENT_DOMAIN}]: " NC_HOST
+NC_HOST=${NC_HOST:-${CURRENT_DOMAIN}}
+
+read -rp "External HTTP port for Traefik [${DEFAULT_HTTP_PORT}]: " TRAEFIK_HTTP_PORT
+TRAEFIK_HTTP_PORT=${TRAEFIK_HTTP_PORT:-${DEFAULT_HTTP_PORT}}
+
+# DB password
+read -rsp "Postgres password for 'nocodb' user [leave blank to auto-generate]: " NC_DB_PASSWORD
+echo
+if [[ -z "${NC_DB_PASSWORD}" ]]; then
+  NC_DB_PASSWORD="$(openssl rand -hex 16)"
+  echo "[INFO] Generated random DB password: ${NC_DB_PASSWORD}"
 fi
 
 NC_PUBLIC_URL="https://${NC_HOST}"
 
 echo
-echo "=========== Summary ==========="
+echo "=== Summary ==="
 echo "  Domain:           ${NC_HOST}"
 echo "  Public URL:       ${NC_PUBLIC_URL}"
 echo "  HTTP Port:        ${TRAEFIK_HTTP_PORT}"
 echo "  DB Password:      ${NC_DB_PASSWORD}"
-echo "==============================="
 echo
 
-read -rp "Proceed and write docker-compose.yml + start stack? [y/N]: " CONFIRM
+read -rp "Proceed, write docker-compose.yml and start stack? [y/N]: " CONFIRM
 CONFIRM=${CONFIRM:-n}
-if [[ "${CONFIRM}" != "y" && "${CONFIRM}" != "Y" ]]; then
-  echo "[INFO] Aborting setup."
-  exit 0
+if [[ ! "${CONFIRM}" =~ ^[Yy]$ ]]; then
+  echo "Aborting."
+  exit 1
 fi
 
 ########################################
-# Write docker-compose.yml (minimal changes from your version)
+# Write docker-compose.yml
 ########################################
-
-cat > docker-compose.yml <<EOF
+cat > "${BASE_DIR}/docker-compose.yml" <<EOF
 version: "3.9"
 
 services:
   traefik:
     image: traefik:v3.1
-    container_name: nocodb-traefik-1
+    container_name: nocodb-traefik
     command:
       - --api.dashboard=true
       - --api.insecure=false
       - --providers.docker=true
       - --providers.docker.exposedByDefault=false
-      - --providers.docker.endpoint=unix:///var/run/docker.sock
       - --entrypoints.web.address=:80
     ports:
       - "${TRAEFIK_HTTP_PORT}:80"
-      - "8080:8080"   # Traefik dashboard (http://<host>:8080) - protect via firewall/Cloudflare
-    environment:
-      - DOCKER_API_VERSION=1.44
+      - "8080:8080"   # Traefik dashboard (http://<host>:8080) - protect via firewall / Cloudflare
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
@@ -225,9 +208,9 @@ services:
       - nocodb-net
     restart: unless-stopped
 
-  app:
+  nocodb:
     image: nocodb/nocodb:latest
-    container_name: nocodb-app
+    container_name: nocodb-nocodb
     depends_on:
       - postgres
       - redis
@@ -254,20 +237,23 @@ networks:
     driver: bridge
 EOF
 
-echo "[INFO] docker-compose.yml written to $(pwd)/docker-compose.yml"
+echo "[INFO] docker-compose.yml written to ${BASE_DIR}/docker-compose.yml"
 
-# 3. Ensure data dirs exist
-mkdir -p data/postgres data/redis
+########################################
+# Ensure data dirs exist
+########################################
+mkdir -p "${BASE_DIR}/data/postgres" "${BASE_DIR}/data/redis"
 
-# 4. Bring stack up
-echo "[INFO] Starting stack: docker compose up -d"
-docker compose up -d
+########################################
+# Bring stack up
+########################################
+echo "[INFO] Starting stack with: ${DOCKER_COMPOSE_CMD} up -d"
+${DOCKER_COMPOSE_CMD} up -d
 
 echo
 echo "======================================="
-echo "  NocoDB stack is starting up."
+echo "  NocoDB + Traefik stack is up        "
 echo "  URL: ${NC_PUBLIC_URL}"
 echo "======================================="
-echo "If you're using Cloudflare, make sure ${NC_HOST} points to this VM."
-echo "You can also test locally with:"
-echo "  curl -v http://localhost -H \"Host: ${NC_HOST}\""
+echo "If you're using Cloudflare, ensure a DNS record for ${NC_HOST}"
+echo "points to this VM (or Cloudflare Tunnel) correctly."
