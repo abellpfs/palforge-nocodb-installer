@@ -86,7 +86,7 @@ is_ip() {
   return 0
 }
 
-# Simple text progress bar that works in xterm.js
+# Simple text progress bar that works in xterm.js (goes to stderr)
 progress_bar() {
   local percent="$1"
   local width=30
@@ -102,11 +102,12 @@ progress_bar() {
     bar+=" "
   done
 
-  # Single-line, carriage-return update (xterm.js friendly)
-  printf "\rDownloading Image |%s| %3d%%" "$bar" "$percent"
+  # Single-line, carriage-return update (xterm.js friendly, stderr)
+  printf "\rDownloading Image |%s| %3d%%" "$bar" "$percent" >&2
 }
 
 # Download with a smooth, time-based progress bar (no noisy curl output)
+# Progress output -> stderr, so stdout stays clean for path returns
 download_image_with_progress() {
   local url="$1"
   local outfile="$2"
@@ -131,18 +132,19 @@ download_image_with_progress() {
 
   # Wait for curl to finish and check result
   if ! wait "$curl_pid"; then
-    echo
+    echo >&2
     err "Image download failed."
     rm -f "$outfile" || true
     exit 1
   fi
 
-  # Finish at 100% and show a clean 'Done' line
+  # Finish at 100% and show a clean 'Done' line (stderr)
   progress_bar 100
-  printf "\rDownloading Image | %-30s |\n" "Done"
+  printf "\rDownloading Image | %-30s |\n" "Done" >&2
 }
 
 # Get cached image or download a fresh one (with expiration)
+# IMPORTANT: Only the final echo of $img goes to stdout
 get_or_download_image() {
   local url="$1"
   local cache_dir="$2"
@@ -163,7 +165,7 @@ get_or_download_image() {
     if [[ "$ts" =~ ^[0-9]+$ ]]; then
       age_days=$(( (now - ts) / 86400 ))
       if (( age_days <= max_days )); then
-        echo "$img"
+        printf '%s\n' "$img"
         return
       fi
     fi
@@ -171,10 +173,12 @@ get_or_download_image() {
     rm -f "$img" "$stamp"
   fi
 
-  # Need a fresh download
+  # Need a fresh download (progress goes to stderr)
   download_image_with_progress "$url" "$img"
   date +%s > "$stamp"
-  echo "$img"
+
+  # Return path on stdout only
+  printf '%s\n' "$img"
 }
 
 # ------------- Pre-flight checks -------------
