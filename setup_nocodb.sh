@@ -1,288 +1,325 @@
 #!/usr/bin/env bash
-# NocoDB + Postgres + Redis + Traefik (+ optional Cloudflare Tunnel) installer
-# To run (inside the VM):
-#   sudo bash <(curl -sSL https://raw.githubusercontent.com/abellpfs/palforge-nocodb-installer/main/setup_nocodb.sh)
+#
+# NocoDB + Traefik + Postgres + Redis installer (for use INSIDE the VM)
+# Run as:
+#   sudo bash setup_nocodb.sh
+# or
+#   bash <(curl -sSL https://raw.githubusercontent.com/abellpfs/palforge-nocodb-installer/main/setup_nocodb.sh)
+#
 
-set -e
+set -euo pipefail
 
-#######################################
+########################################
 # Helpers
-#######################################
-
+########################################
 log() {
   echo "[INFO] $*"
+}
+
+warn() {
+  echo "[WARN] $*" >&2
 }
 
 err() {
   echo "[ERROR] $*" >&2
 }
 
-random_password() {
-  # random_password <length>
-  local length="${1:-32}"
-  tr -dc 'A-Za-z0-9' </dev/urandom | head -c "${length}"
-}
-
 require_root() {
-  if [[ "$EUID" -ne 0 ]]; then
-    err "This script must be run as root. Try: sudo bash setup_nocodb.sh"
+  if [[ "${EUID}" -ne 0 ]]; then
+    err "This script must be run as root (or via sudo)."
     exit 1
   fi
 }
 
-#######################################
-# Docker install (if missing)
-#######################################
-
-install_docker_if_needed() {
-  if command -v docker &>/dev/null; then
-    log "Docker is already installed."
-    return
+gen_password() {
+  if command -v openssl >/dev/null 2>&1; then
+    # 24-char random, URL-safe-ish
+    openssl rand -base64 32 | tr -d '=+/ ' | cut -c1-24
+  else
+    tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24
   fi
+}
 
-  log "Installing Docker (engine + CLI)..."
-  # Based on Docker's official Linux install instructions.
+########################################
+# Docker install
+########################################
+install_docker() {
+  log "Docker not found. Installing Docker Engine + compose plugin..."
+
   apt-get update -y
-  apt-get install -y ca-certificates curl gnupg lsb-release
+  apt-get install -y ca-certificates curl gnupg lsb-release jq
 
   install -m 0755 -d /etc/apt/keyrings
-  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-  chmod a+r /etc/apt/keyrings/docker.gpg
+  if [[ ! -f /etc/apt/keyrings/docker.gpg ]]; then
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+      | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    chmod a+r /etc/apt/keyrings/docker.gpg
+  fi
 
   local codename
-  codename="$(lsb_release -cs)"
+  codename="$(. /etc/os-release && echo "${VERSION_CODENAME}")"
 
   echo \
 "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${codename} stable" \
     > /etc/apt/sources.list.d/docker.list
 
   apt-get update -y
-  apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  apt-get install -y \
+    docker-ce \
+    docker-ce-cli \
+    containerd.io \
+    docker-buildx-plugin \
+    docker-compose-plugin
 
-  systemctl enable --now docker
+  systemctl enable docker
+  systemctl restart docker
+
   log "Docker installed successfully."
 }
 
-#######################################
-# Main
-#######################################
+ensure_docker() {
+  if ! command -v docker >/dev/null 2>&1; then
+    install_docker
+  else
+    log "Docker is already installed."
+  fi
 
+  if ! docker info >/dev/null 2>&1; then
+    err "Docker daemon is not running or not accessible. Check 'systemctl status docker'."
+    exit 1
+  fi
+
+  if ! docker compose version >/dev/null 2>&1; then
+    err "docker compose plugin not available. Ensure 'docker-compose-plugin' is installed."
+    exit 1
+  fi
+}
+
+########################################
+# Main
+########################################
 require_root
+
+echo "======================================="
+echo "  NocoDB + Traefik Installer (VM)      "
+echo "======================================="
 
 log "Updating apt and installing base dependencies..."
 apt-get update -y
 apt-get install -y ca-certificates curl gnupg lsb-release jq
 
-install_docker_if_needed
+ensure_docker
 
 BASE_DIR="/opt/nocodb"
-DOCKER_COMPOSE_FILE="${BASE_DIR}/docker-compose.yml"
-
 log "Ensuring base directory exists at ${BASE_DIR}..."
 mkdir -p "${BASE_DIR}"
 
+########################################
+# Collect configuration
+########################################
 log "We will now collect configuration for NocoDB and its services."
 
-# Domain / Host routing
-read -r -p "Enter the domain for NocoDB (e.g. sales.palforge.it) [leave blank for no host routing]: " DOMAIN
+# Domain for Host routing
+read -rp "Enter the domain for NocoDB (e.g. sales.palforge.it) [leave blank for no host routing]: " DOMAIN
 DOMAIN="${DOMAIN:-}"
 
-# Admin email
-read -r -p "Enter NocoDB admin email [admin@example.com]: " ADMIN_EMAIL
-ADMIN_EMAIL="${ADMIN_EMAIL:-admin@example.com}"
-
-# Admin password
-read -s -p "Enter NocoDB admin password (leave blank to auto-generate): " ADMIN_PASSWORD
-echo
-if [[ -z "${ADMIN_PASSWORD}" ]]; then
-  ADMIN_PASSWORD="$(random_password 20)"
-  log "Generated random admin password: ${ADMIN_PASSWORD}"
-fi
-
 # Postgres password
-read -s -p "Enter Postgres password for 'nocodb' user (leave blank to auto-generate): " POSTGRES_PASSWORD
+read -rp "Enter Postgres password for 'nocodb' user (leave blank to auto-generate): " -s PG_PASSWORD
 echo
-if [[ -z "${POSTGRES_PASSWORD}" ]]; then
-  POSTGRES_PASSWORD="$(random_password 24)"
-  log "Generated random Postgres password: ${POSTGRES_PASSWORD}"
+if [[ -z "${PG_PASSWORD}" ]]; then
+  PG_PASSWORD="$(gen_password)"
+  log "Generated random Postgres password: ${PG_PASSWORD}"
+else
+  log "Using provided Postgres password."
 fi
 
 # Traefik dashboard
-read -r -p "Expose Traefik dashboard on port 8080? (y/N): " EXPOSE_DASHBOARD
-EXPOSE_DASHBOARD="${EXPOSE_DASHBOARD:-N}"
+read -rp "Expose Traefik dashboard on port 8080? (y/N): " EXPOSE_DASHBOARD
+EXPOSE_DASHBOARD="${EXPOSE_DASHBOARD:-n}"
+EXPOSE_DASHBOARD="$(echo "${EXPOSE_DASHBOARD}" | tr '[:upper:]' '[:lower:]')"
+
+# Watchtower
+read -rp "Install Watchtower for automatic image updates? (y/N): " USE_WATCHTOWER
+USE_WATCHTOWER="${USE_WATCHTOWER:-n}"
+USE_WATCHTOWER="$(echo "${USE_WATCHTOWER}" | tr '[:upper:]' '[:lower:]')"
 
 # Cloudflare Tunnel
-read -r -p "Do you want to run a Cloudflare Tunnel (cloudflared container)? (y/N): " INSTALL_CF
-INSTALL_CF="${INSTALL_CF:-N}"
+read -rp "Do you want to run a Cloudflare Tunnel container for this instance? (y/N): " USE_CLOUDFLARE
+USE_CLOUDFLARE="${USE_CLOUDFLARE:-n}"
+USE_CLOUDFLARE="$(echo "${USE_CLOUDFLARE}" | tr '[:upper:]' '[:lower:]')"
 
-CF_TUNNEL_TOKEN=""
-if [[ "${INSTALL_CF}" =~ ^[Yy]$ ]]; then
-  read -r -p "Enter your Cloudflare Tunnel token (from Cloudflare dashboard): " CF_TUNNEL_TOKEN
-  if [[ -z "${CF_TUNNEL_TOKEN}" ]]; then
-    err "Cloudflare Tunnel token cannot be empty if Cloudflare integration is enabled."
+CLOUDFLARE_TOKEN=""
+if [[ "${USE_CLOUDFLARE}" == "y" ]]; then
+  read -rp "Enter your Cloudflare Tunnel token (from Cloudflare dashboard): " CLOUDFLARE_TOKEN
+  if [[ -z "${CLOUDFLARE_TOKEN}" ]]; then
+    err "Cloudflare Tunnel token cannot be empty if you enabled Cloudflare Tunnel."
     exit 1
   fi
 fi
 
-# JWT secret for NocoDB
-JWT_SECRET="$(random_password 32)"
-
-#######################################
+########################################
 # Generate docker-compose.yml
-#######################################
+########################################
+log "Writing docker-compose stack to ${BASE_DIR}/docker-compose.yml..."
 
-log "Writing docker-compose stack to ${DOCKER_COMPOSE_FILE}..."
+# Build ports block for traefik
+TRAEFIK_PORTS="
+    ports:
+      - \"80:80\""
+if [[ "${EXPOSE_DASHBOARD}" == "y" ]]; then
+  TRAEFIK_PORTS="${TRAEFIK_PORTS}
+      - \"8080:8080\""
+fi
 
-# We’ll always define services, and conditionally add labels / cloudflared.
-{
-cat <<EOF
+# Optional Watchtower service
+WATCHTOWER_BLOCK=""
+if [[ "${USE_WATCHTOWER}" == "y" ]]; then
+  WATCHTOWER_BLOCK=$(cat <<'EOF_WT'
+
+  watchtower:
+    image: containrrr/watchtower:latest
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: --cleanup --interval 86400
+EOF_WT
+)
+fi
+
+cat > "${BASE_DIR}/docker-compose.yml" <<EOF
 services:
-  nocodb-postgres:
-    image: postgres:16-alpine
+  traefik:
+    image: traefik:v3.1
     restart: unless-stopped
+    command:
+      - "--api.dashboard=true"
+      - "--api.insecure=true"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedByDefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.traefik.address=:8080"
     environment:
-      POSTGRES_DB: nocodb
-      POSTGRES_USER: nocodb
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      - DOCKER_API_VERSION=1.44
     volumes:
-      - ${BASE_DIR}/postgres_data:/var/lib/postgresql/data
-    networks:
-      - nocodb-net
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+${TRAEFIK_PORTS}
 
-  nocodb-redis:
-    image: redis:7-alpine
-    restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes"]
-    volumes:
-      - ${BASE_DIR}/redis_data:/data
-    networks:
-      - nocodb-net
-
-  nocodb-app:
+  nocodb:
     image: nocodb/nocodb:latest
     restart: unless-stopped
     depends_on:
       - nocodb-postgres
       - nocodb-redis
     environment:
-      NC_DB: "pg://nocodb-postgres:5432?u=nocodb&p=${POSTGRES_PASSWORD}&d=nocodb"
-      NC_REDIS_URL: "redis://nocodb-redis:6379"
-      NC_AUTH_JWT_SECRET: "${JWT_SECRET}"
-      NC_ADMIN_EMAIL: "${ADMIN_EMAIL}"
-      NC_ADMIN_PASSWORD: "${ADMIN_PASSWORD}"
-    volumes:
-      - ${BASE_DIR}/nc_data:/usr/app/data
-    networks:
-      - nocodb-net
-EOF
-
-# If a domain was provided, add Traefik labels; otherwise expose port 8080 directly.
-if [[ -n "${DOMAIN}" ]]; then
-cat <<EOF
+      - NC_DB=pg://nocodb-postgres:5432?u=nocodb&p=${PG_PASSWORD}&d=nocodb
+      - NC_REDIS_ENABLED=true
+      - NC_REDIS_URL=redis://nocodb-redis:6379
     labels:
       - "traefik.enable=true"
+EOF
+
+# Add domain-based routing label only if DOMAIN was provided
+if [[ -n "${DOMAIN}" ]]; then
+  cat >> "${BASE_DIR}/docker-compose.yml" <<EOF
       - "traefik.http.routers.nocodb.rule=Host(\`${DOMAIN}\`)"
+EOF
+else
+  cat >> "${BASE_DIR}/docker-compose.yml" <<EOF
+      - "traefik.http.routers.nocodb.rule=PathPrefix(\`/\`)"
+EOF
+fi
+
+cat >> "${BASE_DIR}/docker-compose.yml" <<'EOF'
       - "traefik.http.routers.nocodb.entrypoints=web"
-      - "traefik.http.services.nocodb.loadbalancer.server.port=8080"
-EOF
-else
-cat <<EOF
-    ports:
-      - "8080:8080"
-EOF
-fi
 
-# Traefik service
-cat <<EOF
-
-  traefik:
-    image: traefik:v3.1
+  nocodb-postgres:
+    image: postgres:16-alpine
     restart: unless-stopped
-    command:
-      - "--providers.docker=true"
-      - "--providers.docker.exposedByDefault=false"
-      - "--entrypoints.web.address=:80"
+    environment:
+      - POSTGRES_USER=nocodb
+      - POSTGRES_PASSWORD=__PG_PASSWORD__
+      - POSTGRES_DB=nocodb
+    volumes:
+      - nocodb-postgres-data:/var/lib/postgresql/data
+
+  nocodb-redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - nocodb-redis-data:/data
 EOF
 
-if [[ "${EXPOSE_DASHBOARD}" =~ ^[Yy]$ ]]; then
-cat <<'EOF'
-      - "--api.dashboard=true"
-      - "--api.insecure=true"
-EOF
-else
-cat <<'EOF'
-      - "--api.dashboard=false"
-EOF
+# Replace placeholder PG password safely
+sed -i "s/__PG_PASSWORD__/${PG_PASSWORD}/g" "${BASE_DIR}/docker-compose.yml"
+
+# Append Watchtower if enabled
+if [[ -n "${WATCHTOWER_BLOCK}" ]]; then
+  echo "${WATCHTOWER_BLOCK}" >> "${BASE_DIR}/docker-compose.yml"
 fi
 
-cat <<EOF
-    ports:
-      - "80:80"
-      - "8080:8080"
-    environment:
-      - DOCKER_API_VERSION=1.52
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-    networks:
-      - nocodb-net
-EOF
-
-# Optional cloudflared service
-if [[ "${INSTALL_CF}" =~ ^[Yy]$ ]]; then
-cat <<EOF
+# Append Cloudflare Tunnel service if requested
+if [[ "${USE_CLOUDFLARE}" == "y" ]]; then
+  cat >> "${BASE_DIR}/docker-compose.yml" <<EOF
 
   cloudflared:
     image: cloudflare/cloudflared:latest
     restart: unless-stopped
-    command: tunnel --no-autoupdate run --token ${CF_TUNNEL_TOKEN}
-    networks:
-      - nocodb-net
+    depends_on:
+      - traefik
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TOKEN}
 EOF
 fi
 
-# Watchtower (optional but nice)
-cat <<EOF
+# Volumes
+cat >> "${BASE_DIR}/docker-compose.yml" <<'EOF'
 
-  watchtower:
-    image: containrrr/watchtower
-    restart: unless-stopped
-    command: --cleanup --interval 86400
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    networks:
-      - nocodb-net
-
-networks:
-  nocodb-net:
-    driver: bridge
+volumes:
+  nocodb-postgres-data:
+  nocodb-redis-data:
 EOF
-
-} > "${DOCKER_COMPOSE_FILE}"
 
 log "docker-compose.yml created."
 
-#######################################
-# Bring up the stack
-#######################################
-
-log "Starting NocoDB stack with Docker Compose..."
+########################################
+# Start stack
+########################################
 cd "${BASE_DIR}"
 
+log "Pulling images..."
 docker compose pull
+
+log "Starting NocoDB stack..."
 docker compose up -d
 
-log "Stack started."
+log "Current container status:"
+docker compose ps
 
+########################################
+# Final info
+########################################
+HOST_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<your-vm-ip>")
+
+echo
+echo "======================================="
+echo "        NocoDB Deployment Info         "
+echo "======================================="
+echo "Postgres user:     nocodb"
+echo "Postgres password: ${PG_PASSWORD}"
+echo "Postgres database: nocodb"
+echo
 if [[ -n "${DOMAIN}" ]]; then
-  log "NocoDB should be reachable via Traefik at: http://${DOMAIN} (or via your Cloudflare Tunnel if configured)."
-else
-  log "NocoDB should be reachable at: http://<this-vm-ip>:8080"
+  echo "NocoDB (via Traefik):  http://${DOMAIN}"
 fi
-
-log "Admin email:    ${ADMIN_EMAIL}"
-log "Admin password: ${ADMIN_PASSWORD}"
-log "Postgres DB:    nocodb"
-log "Postgres user:  nocodb"
-log "Postgres pass:  ${POSTGRES_PASSWORD}"
-
-log "Done."
+echo "Local NocoDB (via Traefik):  http://${HOST_IP}"
+if [[ "${EXPOSE_DASHBOARD}" == "y" ]]; then
+  echo "Traefik dashboard:     http://${HOST_IP}:8080"
+fi
+if [[ "${USE_CLOUDFLARE}" == "y" ]]; then
+  echo
+  echo "Cloudflare Tunnel is running using your token."
+  echo "Use your Cloudflare DNS (CNAME to the tunnel) to reach NocoDB externally."
+fi
+echo
+echo "On first visit, NocoDB will prompt you to create the initial admin account."
+echo "All done."
