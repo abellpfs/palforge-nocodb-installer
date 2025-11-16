@@ -3,7 +3,7 @@
 # NocoDB + Traefik + Postgres + Redis installer (for use INSIDE the VM)
 # Run as:
 #   sudo bash setup_nocodb.sh
-# or
+# or:
 #   bash <(curl -sSL https://raw.githubusercontent.com/abellpfs/palforge-nocodb-installer/main/setup_nocodb.sh)
 #
 
@@ -33,7 +33,6 @@ require_root() {
 
 gen_password() {
   if command -v openssl >/dev/null 2>&1; then
-    # 24-char random, URL-safe-ish
     openssl rand -base64 32 | tr -d '=+/ ' | cut -c1-24
   else
     tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24
@@ -41,7 +40,7 @@ gen_password() {
 }
 
 ########################################
-# Docker install
+# Docker install / check
 ########################################
 install_docker() {
   log "Docker not found. Installing Docker Engine + compose plugin..."
@@ -96,6 +95,52 @@ ensure_docker() {
 }
 
 ########################################
+# Cloudflare (apt-based, systemd service)
+########################################
+ensure_cloudflared_installed() {
+  if command -v cloudflared >/dev/null 2>&1; then
+    log "cloudflared already installed."
+    return
+  fi
+
+  log "Installing cloudflared via apt..."
+
+  mkdir -p --mode=0755 /usr/share/keyrings
+  if [[ ! -f /usr/share/keyrings/cloudflare-public-v2.gpg ]]; then
+    curl -fsSL https://pkg.cloudflare.com/cloudflare-public-v2.gpg \
+      | tee /usr/share/keyrings/cloudflare-public-v2.gpg >/dev/null
+  fi
+
+  echo 'deb [signed-by=/usr/share/keyrings/cloudflare-public-v2.gpg] https://pkg.cloudflare.com/cloudflared any main' \
+    > /etc/apt/sources.list.d/cloudflared.list
+
+  apt-get update -y
+  apt-get install -y cloudflared
+
+  log "cloudflared installed."
+}
+
+configure_cloudflared_service() {
+  local token="$1"
+
+  ensure_cloudflared_installed
+
+  # If config already exists, assume it's already set up
+  if [[ -f /etc/cloudflared/config.yml ]]; then
+    warn "cloudflared already appears to be configured (/etc/cloudflared/config.yml exists)."
+    warn "Skipping 'cloudflared service install'. If you need to reconfigure, remove that file first."
+  else
+    log "Running 'cloudflared service install' with provided token..."
+    cloudflared service install "${token}"
+  fi
+
+  systemctl daemon-reload || true
+  systemctl enable --now cloudflared || true
+
+  log "cloudflared systemd service is installed and (should be) running."
+}
+
+########################################
 # Main
 ########################################
 require_root
@@ -143,8 +188,8 @@ read -rp "Install Watchtower for automatic image updates? (y/N): " USE_WATCHTOWE
 USE_WATCHTOWER="${USE_WATCHTOWER:-n}"
 USE_WATCHTOWER="$(echo "${USE_WATCHTOWER}" | tr '[:upper:]' '[:lower:]')"
 
-# Cloudflare Tunnel
-read -rp "Do you want to run a Cloudflare Tunnel container for this instance? (y/N): " USE_CLOUDFLARE
+# Cloudflare Tunnel (apt + systemd)
+read -rp "Install & configure Cloudflare Tunnel via cloudflared service? (y/N): " USE_CLOUDFLARE
 USE_CLOUDFLARE="${USE_CLOUDFLARE:-n}"
 USE_CLOUDFLARE="$(echo "${USE_CLOUDFLARE}" | tr '[:upper:]' '[:lower:]')"
 
@@ -218,7 +263,7 @@ ${TRAEFIK_PORTS}
       - "traefik.enable=true"
 EOF
 
-# Add domain-based routing label only if DOMAIN was provided
+# Add routing rule
 if [[ -n "${DOMAIN}" ]]; then
   cat >> "${BASE_DIR}/docker-compose.yml" <<EOF
       - "traefik.http.routers.nocodb.rule=Host(\`${DOMAIN}\`)"
@@ -250,7 +295,7 @@ cat >> "${BASE_DIR}/docker-compose.yml" <<'EOF'
       - nocodb-redis-data:/data
 EOF
 
-# Replace placeholder PG password safely
+# Substitute Postgres password
 sed -i "s/__PG_PASSWORD__/${PG_PASSWORD}/g" "${BASE_DIR}/docker-compose.yml"
 
 # Append Watchtower if enabled
@@ -258,20 +303,7 @@ if [[ -n "${WATCHTOWER_BLOCK}" ]]; then
   echo "${WATCHTOWER_BLOCK}" >> "${BASE_DIR}/docker-compose.yml"
 fi
 
-# Append Cloudflare Tunnel service if requested
-if [[ "${USE_CLOUDFLARE}" == "y" ]]; then
-  cat >> "${BASE_DIR}/docker-compose.yml" <<EOF
-
-  cloudflared:
-    image: cloudflare/cloudflared:latest
-    restart: unless-stopped
-    depends_on:
-      - traefik
-    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TOKEN}
-EOF
-fi
-
-# Volumes
+# Volumes block
 cat >> "${BASE_DIR}/docker-compose.yml" <<'EOF'
 
 volumes:
@@ -282,7 +314,7 @@ EOF
 log "docker-compose.yml created."
 
 ########################################
-# Start stack
+# Start NocoDB stack
 ########################################
 cd "${BASE_DIR}"
 
@@ -294,6 +326,13 @@ docker compose up -d
 
 log "Current container status:"
 docker compose ps
+
+########################################
+# Cloudflare configuration (if requested)
+########################################
+if [[ "${USE_CLOUDFLARE}" == "y" ]]; then
+  configure_cloudflared_service "${CLOUDFLARE_TOKEN}"
+fi
 
 ########################################
 # Final info
@@ -309,16 +348,17 @@ echo "Postgres password: ${PG_PASSWORD}"
 echo "Postgres database: nocodb"
 echo
 if [[ -n "${DOMAIN}" ]]; then
-  echo "NocoDB (via Traefik):  http://${DOMAIN}"
+  echo "NocoDB (via Traefik):        http://${DOMAIN}"
 fi
 echo "Local NocoDB (via Traefik):  http://${HOST_IP}"
 if [[ "${EXPOSE_DASHBOARD}" == "y" ]]; then
-  echo "Traefik dashboard:     http://${HOST_IP}:8080"
+  echo "Traefik dashboard:           http://${HOST_IP}:8080"
 fi
 if [[ "${USE_CLOUDFLARE}" == "y" ]]; then
   echo
-  echo "Cloudflare Tunnel is running using your token."
-  echo "Use your Cloudflare DNS (CNAME to the tunnel) to reach NocoDB externally."
+  echo "Cloudflare Tunnel:"
+  echo "- cloudflared installed via apt and running as a systemd service."
+  echo "- DNS & hostname for the tunnel are managed in your Cloudflare dashboard."
 fi
 echo
 echo "On first visit, NocoDB will prompt you to create the initial admin account."
