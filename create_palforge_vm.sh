@@ -4,6 +4,11 @@ set -euo pipefail
 # Pal Forge IT - General Purpose VM Factory for Proxmox
 # Creates a cloud-init Ubuntu VM with standard Pal Forge naming, tags, and options.
 
+# ------------- Globals -------------
+
+TMP_IMG=""
+VM_CREATED=0
+
 # ------------- Helpers -------------
 
 err() {
@@ -57,6 +62,62 @@ yes_no_default() {
   else
     return 1
   fi
+}
+
+# Simple text progress bar that works in xterm.js
+progress_bar() {
+  local percent="$1"
+  local width=30
+  local filled=$((percent * width / 100))
+  local empty=$((width - filled))
+  local bar=""
+  local i
+
+  for ((i=0; i<filled; i++)); do
+    bar+="#"
+  done
+  for ((i=0; i<empty; i++)); do
+    bar+=" "
+  done
+
+  # Single-line, carriage-return update (xterm.js friendly)
+  printf "\rDownloading Image |%s| %3d%%" "$bar" "$percent"
+}
+
+# Download with a smooth, time-based progress bar (no noisy curl output)
+download_image_with_progress() {
+  local url="$1"
+  local outfile="$2"
+
+  # Start curl quietly in the background
+  (
+    curl -L -sSf "$url" -o "$outfile"
+  ) &
+  local curl_pid=$!
+
+  local percent=0
+  progress_bar "$percent"
+
+  # Animate while curl is running
+  while kill -0 "$curl_pid" 2>/dev/null; do
+    if (( percent < 99 )); then
+      percent=$((percent + 1))
+    fi
+    progress_bar "$percent"
+    sleep 0.2
+  done
+
+  # Wait for curl to finish and check result
+  if ! wait "$curl_pid"; then
+    echo
+    err "Image download failed."
+    exit 1
+  fi
+
+  # Finish at 100% and show a clean 'Done' line
+  progress_bar 100
+  # Overwrite with a nice Done line
+  printf "\rDownloading Image | %-30s |\n" "Done"
 }
 
 # ------------- Pre-flight checks -------------
@@ -314,7 +375,7 @@ fi
 echo
 echo "Downloading Ubuntu cloud image..."
 TMP_IMG="$(mktemp --suffix=.img)"
-curl -L "$IMAGE_URL" -o "$TMP_IMG"
+download_image_with_progress "$IMAGE_URL" "$TMP_IMG"
 
 # ------------- Create VM -------------
 
