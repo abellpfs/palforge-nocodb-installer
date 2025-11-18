@@ -1,134 +1,90 @@
+cat >/root/setup_nocodb_fresh.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
 echo "============================================================"
-echo " Pal Forge NocoDB + Traefik + (optional) Cloudflare Setup"
+echo " Pal Forge NocoDB + Traefik Setup (Clean Deploy)"
 echo "============================================================"
 echo
 
-#--------------------------------------------------------------
-# 0. Root check
-#--------------------------------------------------------------
-if [[ "${EUID}" -ne 0 ]]; then
-  echo "[ERROR] This script must be run as root (or via sudo)." >&2
-  exit 1
-fi
-
-#--------------------------------------------------------------
-# 1. Base paths & helpers
-#--------------------------------------------------------------
-NC_DIR="/opt/nocodb"
-DAEMON_JSON="/etc/docker/daemon.json"
-
-mkdir -p "${NC_DIR}"
-cd "${NC_DIR}"
-
-log() { echo -e "[INFO] $*"; }
-warn() { echo -e "[WARN] $*" >&2; }
-err() { echo -e "[ERROR] $*" >&2; }
-
-#--------------------------------------------------------------
-# 2. Ensure Docker + basic tools
-#--------------------------------------------------------------
-log "Ensuring curl, jq, and Docker are installed..."
-
-apt-get update -y
-apt-get install -y curl jq ca-certificates docker.io
-
+#-------------------------------
+# 0. Pre-checks (Docker + compose)
+#-------------------------------
 if ! command -v docker >/dev/null 2>&1; then
-  err "Docker binary not found even after installation. Aborting."
+  echo "[ERROR] Docker is not installed or not in PATH."
+  echo "        Please install Docker first, then re-run this script."
   exit 1
 fi
 
 if ! docker compose version >/dev/null 2>&1; then
-  warn "docker compose plugin not found via 'docker compose'."
-  warn "Check Docker CLI plugins if this fails later."
+  echo "[ERROR] docker compose plugin is not available."
+  echo "        Install it with: apt-get install -y docker-compose-plugin"
+  exit 1
 fi
 
-#--------------------------------------------------------------
-# 3. Ensure Docker daemon.json has min API + log options
-#--------------------------------------------------------------
-log "Ensuring /etc/docker/daemon.json has min-api-version and log options..."
+echo "[OK] Docker and docker compose are available."
+echo
 
-if [[ -f "${DAEMON_JSON}" ]]; then
-  # Merge/override using jq to avoid clobbering other keys
-  tmp="$(mktemp)"
-  jq '. + {
-    "min-api-version": "1.24",
-    "log-driver": "json-file",
-    "log-opts": {"max-size": "10m", "max-file": "3"}
-  }' "${DAEMON_JSON}" > "${tmp}" || {
-    err "Failed to update ${DAEMON_JSON} with jq."
-    rm -f "${tmp}"
-    exit 1
-  }
-  mv "${tmp}" "${DAEMON_JSON}"
-else
-  cat > "${DAEMON_JSON}" <<EOF
-{
-  "min-api-version": "1.24",
-  "log-driver": "json-file",
-  "log-opts": {
-    "max-size": "10m",
-    "max-file": "3"
-  }
-}
-EOF
-fi
-
-systemctl restart docker
-log "Docker restarted to apply daemon.json changes."
-
-#--------------------------------------------------------------
-# 4. Ask for config
-#--------------------------------------------------------------
+#-------------------------------
+# 1. Ask basic questions
+#-------------------------------
 read -rp "Domain for NocoDB [sales.palforge.it]: " NC_HOST
-NC_HOST="${NC_HOST:-sales.palforge.it}"
+NC_HOST=${NC_HOST:-sales.palforge.it}
 
 read -rp "External HTTP port for Traefik [80]: " TRAEFIK_HTTP_PORT
-TRAEFIK_HTTP_PORT="${TRAEFIK_HTTP_PORT:-80}"
+TRAEFIK_HTTP_PORT=${TRAEFIK_HTTP_PORT:-80}
 
-read -rsp "Postgres password for 'nocodb' user [auto-generate]: " NC_DB_PASSWORD || true
+read -rsp "Postgres password for 'nocodb' user [auto-generate]: " NC_DB_PASSWORD
 echo
 if [[ -z "${NC_DB_PASSWORD}" ]]; then
-  NC_DB_PASSWORD="$(openssl rand -hex 16)"
-  log "Generated DB password: ${NC_DB_PASSWORD}"
+  NC_DB_PASSWORD=$(openssl rand -hex 16)
+  echo "[INFO] Generated DB password: ${NC_DB_PASSWORD}"
 fi
 
 NC_PUBLIC_URL="https://${NC_HOST}"
 
 echo
-echo "=== Summary ==="
+echo "================ SUMMARY ================"
 echo "  Domain:           ${NC_HOST}"
 echo "  Public URL:       ${NC_PUBLIC_URL}"
 echo "  HTTP Port:        ${TRAEFIK_HTTP_PORT}"
 echo "  DB Password:      ${NC_DB_PASSWORD}"
+echo "========================================="
 echo
 
-read -rp "Use Cloudflare Tunnel for this domain? [y/N]: " USE_CF
-USE_CF="${USE_CF:-n}"
-
-CF_TOKEN=""
-if [[ "${USE_CF}" =~ ^[Yy]$ ]]; then
-  read -rsp "Enter Cloudflare tunnel token: " CF_TOKEN
-  echo
+read -rp "Proceed with clean NocoDB stack deploy at /opt/nocodb? [y/N]: " CONFIRM
+CONFIRM=${CONFIRM:-n}
+if [[ "${CONFIRM}" != "y" && "${CONFIRM}" != "Y" ]]; then
+  echo "[ABORT] User cancelled."
+  exit 1
 fi
 
-read -rp "Proceed with this configuration and (re)deploy stack? [y/N]: " CONFIRM
-CONFIRM="${CONFIRM:-n}"
-if [[ ! "${CONFIRM}" =~ ^[Yy]$ ]]; then
-  echo "Aborting."
-  exit 0
+#-------------------------------
+# 2. Prepare /opt/nocodb cleanly
+#-------------------------------
+INSTALL_DIR="/opt/nocodb"
+echo "[INFO] Creating clean install dir: ${INSTALL_DIR}"
+
+mkdir -p "${INSTALL_DIR}"
+cd "${INSTALL_DIR}"
+
+# Stop any existing compose stack in /opt/nocodb
+if docker compose ps >/dev/null 2>&1; then
+  echo "[INFO] Stopping any existing NocoDB stack in ${INSTALL_DIR}..."
+  docker compose down --remove-orphans || true
 fi
 
-#--------------------------------------------------------------
-# 5. Write docker-compose.yml (fixed networking)
-#   - IMPORTANT: removed 'traefik.docker.network=...' label
-#     so Traefik auto-selects the correct network.
-#--------------------------------------------------------------
-log "Writing docker-compose.yml to ${NC_DIR}..."
+# Remove old data dirs if you truly want a fresh instance
+# Comment these out if you want to keep old DB data.
+rm -rf "${INSTALL_DIR}/data"
+mkdir -p "${INSTALL_DIR}/data/postgres" "${INSTALL_DIR}/data/redis"
 
-cat > docker-compose.yml <<EOF
+#-------------------------------
+# 3. Write docker-compose.yml
+#   - Use an explicit named network: nocodb_nocodb-net
+#   - Traefik and NocoDB share this network
+#-------------------------------
+cat > "${INSTALL_DIR}/docker-compose.yml" <<EOF_INNER
 services:
   traefik:
     image: traefik:v3.1
@@ -141,7 +97,7 @@ services:
       - --entrypoints.web.address=:80
     ports:
       - "${TRAEFIK_HTTP_PORT}:80"
-      - "8080:8080"
+      - "8080:8080"  # Traefik dashboard
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
@@ -188,6 +144,7 @@ services:
       - NC_PUBLIC_URL=${NC_PUBLIC_URL}
     labels:
       - "traefik.enable=true"
+      - "traefik.docker.network=nocodb_nocodb-net"
       - "traefik.http.routers.nocodb.rule=Host(\`${NC_HOST}\`)"
       - "traefik.http.routers.nocodb.entrypoints=web"
       - "traefik.http.services.nocodb.loadbalancer.server.port=8080"
@@ -197,80 +154,49 @@ services:
 
 networks:
   nocodb-net:
+    name: nocodb_nocodb-net
     driver: bridge
-EOF
+EOF_INNER
 
-mkdir -p data/postgres data/redis
+echo "[INFO] docker-compose.yml written to ${INSTALL_DIR}/docker-compose.yml"
+echo
 
-#--------------------------------------------------------------
-# 6. (Optional) Install / update Cloudflare Tunnel
-#--------------------------------------------------------------
-if [[ "${USE_CF}" =~ ^[Yy]$ ]]; then
-  log "Ensuring cloudflared is installed..."
-
-  if ! command -v cloudflared >/dev/null 2>&1; then
-    mkdir -p /usr/share/keyrings
-    curl -fsSL https://pkg.cloudflare.com/cloudflare-public-v2.gpg \
-      | tee /usr/share/keyrings/cloudflare-public-v2.gpg >/dev/null
-
-    echo "deb [signed-by=/usr/share/keyrings/cloudflare-public-v2.gpg] https://pkg.cloudflare.com/cloudflared any main" \
-      > /etc/apt/sources.list.d/cloudflared.list
-
-    apt-get update -y
-    apt-get install -y cloudflared
-  fi
-
-  if [[ -n "${CF_TOKEN}" ]]; then
-    log "Installing/Updating Cloudflare tunnel service..."
-    tmp_err="$(mktemp)"
-    set +e
-    cloudflared service install "${CF_TOKEN}" 2>"${tmp_err}"
-    rc=$?
-    set -e
-
-    if [[ ${rc} -ne 0 ]]; then
-      if grep -q "cloudflared service is already installed" "${tmp_err}"; then
-        warn "Cloudflare service already installed. Skipping install step."
-      else
-        err "cloudflared service install failed:"
-        cat "${tmp_err}" >&2
-        rm -f "${tmp_err}"
-        exit 1
-      fi
-    else
-      log "Cloudflare tunnel service installed/updated."
-    fi
-    rm -f "${tmp_err}"
-
-    systemctl enable cloudflared
-    systemctl restart cloudflared
-  else
-    warn "Cloudflare token was empty, skipping tunnel install."
-  fi
-else
-  log "Skipping Cloudflare Tunnel configuration."
-fi
-
-#--------------------------------------------------------------
-# 7. Bring the stack up
-#--------------------------------------------------------------
-log "Starting NocoDB stack with docker compose..."
-
-docker compose pull
+#-------------------------------
+# 4. Bring stack up
+#-------------------------------
+echo "[INFO] Starting NocoDB stack..."
 docker compose up -d
 
 echo
-log "Docker compose status:"
-docker compose ps
+echo "[INFO] Current containers:"
+docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+echo
+
+#-------------------------------
+# 5. Quick local routing test
+#-------------------------------
+echo "[INFO] Testing Traefik route locally..."
+sleep 5
+curl -sS -o /tmp/nocodb_test.html -w "%{http_code}\n" \
+  -H "Host: ${NC_HOST}" \
+  http://localhost/ || true
+
+HTTP_CODE=$(tail -n1 /tmp/nocodb_test.html || echo "unknown")
 
 echo
 echo "============================================================"
-echo " NocoDB deployment complete."
-echo " - Public URL: ${NC_PUBLIC_URL}"
-echo " - Traefik HTTP: ${TRAEFIK_HTTP_PORT} (local VM port)"
-echo " - Traefik dashboard: http://<VM-IP>:8080 (protect via firewall/Cloudflare)"
-echo
-echo "If using Cloudflare:"
-echo " - Ensure sales.palforge.it is proxied to this VM/tunnel."
-echo " - Cloudflared is expected to route sales.palforge.it -> http://localhost"
+echo " Setup complete (stack started)"
 echo "============================================================"
+echo "  Try opening: http://${NC_HOST}  (if DNS points to this server)"
+echo "  Or from this VM: curl -H \"Host: ${NC_HOST}\" http://localhost"
+echo "  Local Traefik dashboard: http://<server-ip>:8080"
+echo
+echo "  Last local test HTTP code: ${HTTP_CODE}"
+echo "============================================================"
+EOF
+
+chmod +x /root/setup_nocodb_fresh.sh
+echo
+echo "[READY] Run the installer with:"
+echo "  sudo /root/setup_nocodb_fresh.sh"
+EOF
